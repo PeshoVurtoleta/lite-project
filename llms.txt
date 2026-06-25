@@ -1,0 +1,74 @@
+# @zakkster/lite-project
+
+> Zero-GC projections for @zakkster/lite-signal: granular, derived, non-mutating
+> reactive overlays over a keyed source, with commit / revert / reconcile, plus
+> draft adapters for lite-store and lite-room.
+
+A projection is a lens over a keyed reactive source. It carries EPHEMERAL
+overlays (optimistic edits, drafts, pending state) without mutating the source,
+then commit()s them in or revert()s them out. Each touched key gets its own
+overlay signal + projected computed, so the view is granular and the steady
+state allocates nothing the engine can avoid.
+
+Peer dependency: @zakkster/lite-signal ^1.5.0 (uses createRoot). ESM only. MIT.
+
+## Mental model
+
+- overlay signal per key: ABSENT sentinel | value.
+- projected computed per key: reads overlay if set, else source.get(key); tracks BOTH.
+- get(key) is reactive. set(key,v) writes the OVERLAY only (source untouched).
+- commit() writes overlays into source then clears. revert() drops all overlays.
+- masking: while a key is overlaid, a source change to it is suppressed by the
+  engine's Object.is short-circuit -> the optimistic value is stable, no flicker.
+
+## Entry points
+
+- createProjector(reg) -> { project, keyedStore }   // bind to any lite-signal registry
+- project(source) -> Projection                       // default registry
+- keyedStore(initial?) -> { get, set, has, keys }     // minimal built-in source
+
+## Projection handle
+
+get(key) | set(key,value) | clear(key) | commit(key?) [one key or all] | revert() |
+dirtyCount() [TRACKED reactive] | isDirty() [TRACKED reactive] |
+isOverlaid(key) | overlaidCount() | peek(key) [untracked effective read] |
+forEachOverlay(fn) | reconcileAll(policy?) | dispose() [recycle all owned nodes]
+
+## Source = any { get(key): reactive, set(key, value) }
+
+- fromAccessors(get, set) -> source
+- fromProxy(obj) -> source            // obj[key] tracked read, obj[key]=v write
+
+## Reconciliation
+
+- confirmOnEcho(authoritative, overlay) -> Object.is(...)   // default policy
+- makeReconciler(view, policy?) -> (key, authoritativeValue) => void
+  // per-key handler for a source with an incoming-update event; drops the
+  // overlay when the policy confirms it. Conflicts stay masked.
+
+## Library adapters
+
+- projectStore(store)            // lite-store proxy. Per-key granular drafts;
+                                 // commit() writes through store[key]=v.
+                                 // Top-level keys; pass a nested proxy to go deeper.
+- projectRoom(room, {policy?})   // lite-room room.storage (LWW-Map).
+                                 // Presentation-only optimistic drafts: set = local
+                                 // draft (not synced), commit() = room.storage.set
+                                 // (writes + syncs), auto-reconcile drops confirmed
+                                 // drafts via the coarse `entries` signal; conflicts
+                                 // stay masked. dispose() stops the reconcile effect.
+                                 // CRDT owns the merge; the projection never joins it.
+
+## Zero-GC
+
+Steady state: re-overlaying a warmed key reuses pooled nodes (200k toggles ->
+poolGrowths/totalAllocations flat). First touch of a NEW key allocates its slot,
+a Map entry, and two pooled nodes. Warm the keys you churn.
+
+## Gotchas
+
+- createRoot is REQUIRED (1.5.0+): per-key nodes are created lazily inside the
+  consumer that first reads the key; without detachment they would be adopted by
+  that consumer and cascade-disposed on its next re-run. createRoot detaches them.
+- A projection only refines what the source exposes: over lite-room's coarse
+  storage it is coarse (any storage change re-evaluates every projected key).

@@ -1,0 +1,60 @@
+{
+  "name": "@zakkster/lite-project",
+  "version": "1.0.0",
+  "description": "Zero-GC projections for @zakkster/lite-signal: granular, derived, non-mutating reactive overlays with commit / revert / reconcile, and draft adapters for lite-store and lite-room.",
+  "type": "module",
+  "main": "./Project.js",
+  "module": "./Project.js",
+  "types": "./Project.d.ts",
+  "exports": {
+    ".": {
+      "node": "./Project.js",
+      "types": "./Project.d.ts",
+      "import": "./Project.js",
+      "default": "./Project.js"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "Project.js",
+    "Project.d.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "llms.txt",
+    "LICENSE.txt"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@zakkster/lite-signal": ">=1.5.0-alpha"
+  },
+  "keywords": [
+    "reactive",
+    "signals",
+    "projection",
+    "lens",
+    "optimistic-ui",
+    "overlay",
+    "zero-gc",
+    "esm",
+    "lite-signal"
+  ],
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-project.git"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-project#readme",
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
