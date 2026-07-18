@@ -431,7 +431,7 @@
 <body>
 <div class="wrap">
     <header>
-        <h1>lite-project <span class="v">v1.0.0</span></h1>
+        <h1>lite-project <span class="v">v1.1.0</span></h1>
         <p class="tagline">Zero-GC reactive draft overlays for lite-signal &mdash; stage edits without mutating the
             source; commit, revert, reconcile.</p>
     </header>
@@ -440,6 +440,7 @@
         <button data-scene="overlay" class="active">1 &middot; Overlay</button>
         <button data-scene="granular">2 &middot; Granular</button>
         <button data-scene="reconcile">3 &middot; Reconcile</button>
+        <button data-scene="query">4 &middot; Query</button>
     </nav>
 
     <!-- ------------------------- SCENE 1: OVERLAY ------------------------- -->
@@ -532,6 +533,42 @@
         </div>
     </section>
 
+    <!-- ------------------------- SCENE 4: QUERY -------------------------- -->
+    <section class="scene" data-scene="query">
+        <p class="scene-intro"><code>projectQuery(qc, key)</code> drafts the <b>fields</b> of one lite-query record.
+            Stage several field edits, then <b>commit</b> &mdash; they fold into the cache in a <b>single</b>
+            <code>setQueryData</code> write (one mutation, one broadcast). A <b>refetch</b> that echoes your draft drops it;
+            a conflicting one keeps it masked.</p>
+        <div class="grid two">
+            <div class="panel">
+                <h2>user record</h2>
+                <div class="colhead"><span>field</span><span>cached</span><span>draft</span><span>effective</span></div>
+                <div class="rows" id="q-rows"></div>
+                <div class="controls">
+                    <button class="act" id="q-name">draft name &rarr; "Ada"</button>
+                    <button class="act" id="q-email">draft email &rarr; "ada@x.dev"</button>
+                    <button class="act commit" id="q-commit">commit all &rarr; one write</button>
+                    <button class="act" id="q-echo">refetch echoes draft</button>
+                    <button class="act danger" id="q-conflict">refetch conflicts</button>
+                    <button class="act warn" id="q-revert">revert</button>
+                </div>
+                <p class="note">One <code>commit()</code> = one <code>setQueryData(key, prev =&gt; ({...prev, ...drafts}))</code>,
+                    no matter how many fields are staged. Auto-reconcile watches <code>query.data</code> and drops
+                    confirmed drafts (<code>confirmOnEcho</code>), keeping conflicts masked.</p>
+            </div>
+            <div class="panel">
+                <h2>Telemetry</h2>
+                <div class="stat">
+                    <div class="item"><span class="lab">staged drafts</span><span class="val" id="q-dirty">0</span></div>
+                    <div class="item"><span class="lab">setQueryData writes</span><span class="val" id="q-writes">0</span></div>
+                    <div class="item"><span class="lab">status</span><span class="val" id="q-status">clean</span></div>
+                </div>
+                <h2>Log</h2>
+                <div class="log" id="q-log"></div>
+            </div>
+        </div>
+    </section>
+
     <footer>
         Live on the real engine: <code>@zakkster/lite-project</code> + <code>@zakkster/lite-signal</code>. The "server"
         here is just <code>source.set(...)</code> + <code>reconcileAll()</code>; in production that's an echo from
@@ -542,7 +579,7 @@
 
 <script type="module">
     import {effect} from "@zakkster/lite-signal";
-    import {project, keyedStore, confirmOnEcho} from "@zakkster/lite-project";
+    import {project, keyedStore, confirmOnEcho, projectQuery} from "@zakkster/lite-project";
 
     // ---------------------------------------------------------------------------
     // DOM cache -- resolved once at init ($-prefixed). No lookups inside handlers.
@@ -837,6 +874,93 @@
         logLine($rcLog, "revert &mdash; draft dropped, authoritative shows through", "revert");
         rcRender();
     });
+
+    // ===========================================================================
+    // Scene 4: projectQuery -- optimistic field drafts over a lite-query record
+    // ===========================================================================
+    // Minimal structural lite-query client: getQueryData (peek), setQueryData
+    // (write + fire), a reactive data(key) accessor (like query.data), write count.
+    const $qRows = document.getElementById("q-rows");
+    const $qDirty = document.getElementById("q-dirty");
+    const $qWrites = document.getElementById("q-writes");
+    const $qStatus = document.getElementById("q-status");
+    const $qLog = document.getElementById("q-log");
+    const Q_KEY = ["user", 1];
+    const Q_FIELDS = ["name", "email", "plan"];
+
+    const qCache = keyedStore({ [JSON.stringify(Q_KEY)]: { name: "Grace", email: "grace@x.dev", plan: "free" } });
+    let qWrites = 0;
+    const qc = {
+        getQueryData: (key) => qCache.get(JSON.stringify(key)),
+        setQueryData: (key, v) => {
+            qWrites++; $qWrites.textContent = String(qWrites);
+            const k = JSON.stringify(key);
+            const prev = qCache.get(k);
+            qCache.set(k, typeof v === "function" ? v(prev) : v);
+            return qCache.get(k);
+        },
+    };
+    const qData = () => qCache.get(JSON.stringify(Q_KEY));   // reactive (keyedStore is signal-backed)
+
+    const qProj = projectQuery(qc, Q_KEY, { data: qData });
+
+    // one reactive row per field
+    const qCells = {};
+    for (const f of Q_FIELDS) {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.innerHTML =
+            '<span class="k">' + f + "</span>" +
+            '<span class="cell auth"></span>' +
+            '<span class="cell ov" data-empty="1">&mdash;</span>' +
+            '<span class="cell eff"></span>';
+        $qRows.appendChild(row);
+        qCells[f] = { auth: row.querySelector(".cell.auth"), ov: row.querySelector(".cell.ov"), eff: row.querySelector(".cell.eff") };
+        effect(() => { qCells[f].eff.textContent = String(qProj.get(f) ?? ""); });      // effective (draft or cache)
+        effect(() => { const rec = qData(); qCells[f].auth.textContent = String((rec && rec[f]) ?? ""); }); // authoritative
+    }
+
+    function qRender() {
+        let dirty = 0, conflict = false;
+        const rec = qData() || {};
+        for (const f of Q_FIELDS) {
+            const overlaid = qProj.isOverlaid(f);
+            qCells[f].ov.textContent = overlaid ? String(qProj.peek(f)) : "\u2014";
+            qCells[f].ov.setAttribute("data-empty", overlaid ? "0" : "1");
+            const c = overlaid && !confirmOnEcho(rec[f], qProj.peek(f));
+            qCells[f].eff.setAttribute("data-conflict", c ? "1" : "0");
+            if (overlaid) dirty++;
+            if (c) conflict = true;
+        }
+        $qDirty.textContent = String(dirty);
+        $qStatus.textContent = conflict ? "conflict" : dirty ? "staged" : "clean";
+        $qStatus.dataset.state = conflict ? "conflict" : dirty ? "pending" : "clean";
+    }
+    qRender();
+
+    document.getElementById("q-name").addEventListener("click", () => { qProj.set("name", "Ada"); logLine($qLog, 'draft name &rarr; "Ada" (cache untouched)'); qRender(); });
+    document.getElementById("q-email").addEventListener("click", () => { qProj.set("email", "ada@x.dev"); logLine($qLog, 'draft email &rarr; "ada@x.dev"'); qRender(); });
+    document.getElementById("q-commit").addEventListener("click", () => {
+        const before = qWrites;
+        qProj.commit();
+        logLine($qLog, "commit all staged fields &rarr; " + (qWrites - before) + " setQueryData write", "commit");
+        qRender();
+    });
+    document.getElementById("q-echo").addEventListener("click", () => {
+        // server refetch that matches the current drafts -> auto-reconcile drops them
+        const rec = { ...(qData() || {}) };
+        for (const f of Q_FIELDS) if (qProj.isOverlaid(f)) rec[f] = qProj.peek(f);
+        qc.setQueryData(Q_KEY, rec);
+        logLine($qLog, "refetch echoed the drafts &rarr; auto-reconcile cleared them", "commit");
+        qRender();
+    });
+    document.getElementById("q-conflict").addEventListener("click", () => {
+        const rec = { ...(qData() || {}), plan: "enterprise", name: "Someone Else" };
+        qc.setQueryData(Q_KEY, rec);
+        logLine($qLog, "refetch conflicts &mdash; diverging drafts kept masked", "conflict");
+        qRender();
+    });
+    document.getElementById("q-revert").addEventListener("click", () => { qProj.revert(); logLine($qLog, "revert &mdash; all drafts dropped", "revert"); qRender(); });
 
     // ===========================================================================
     // Tab switching

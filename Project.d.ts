@@ -1,4 +1,4 @@
-// Type declarations for @zakkster/lite-project v1.0.0
+// Type declarations for @zakkster/lite-project v1.1.0
 // Zero-GC projections for @zakkster/lite-signal.
 // (c) 2026 Zahary Shinikchiev <shinikchiev@yahoo.com> -- MIT
 
@@ -61,6 +61,24 @@ export interface Projection<K extends PropertyKey = PropertyKey, V = unknown> {
     commit(key?: K): void;
     /** Drop all overlays. */
     revert(): void;
+    /**
+     * Release slots for keys that are neither overlaid nor observed, returning
+     * how many were freed.
+     *
+     * A slot (one overlay signal + one projected computed) is created by the
+     * first READ of a key and retained until `dispose()`, because its computed
+     * may have live subscribers. Over a large or unbounded keyspace that is real
+     * growth, and neither `commit()` nor `revert()` gives any of it back.
+     *
+     * `prune()` is the safe reclamation path: it skips any key with a staged
+     * overlay (nothing to lose) and any whose projected read still has
+     * observers. A pruned key rebuilds transparently on its next read.
+     *
+     * Cold path -- call it on a viewport change or after a commit, not per frame.
+     * O(slots). Returns 0 on a custom registry that does not supply
+     * `hasObservers`.
+     */
+    prune(): number;
     /** Recycle every projection-owned node back to the lite-signal pool. */
     dispose(): void;
 }
@@ -91,6 +109,18 @@ export interface ProjectorRegistry {
     createRoot<T>(fn: () => T): T;
     dispose(handle: unknown): void;
     untrack<T>(fn: () => T): T;
+    /**
+     * Optional. Coalesces the multi-signal writes in commit / revert /
+     * reconcileAll into one propagation so a multi-key consumer never sees a
+     * torn snapshot. Omit it and those writes propagate one at a time.
+     */
+    batch?<T>(fn: () => T): T;
+    /**
+     * Optional. Required by {@link Projection.prune}, which uses it to tell a
+     * slot nobody is subscribed to from one a consumer still depends on. Omit it
+     * and `prune()` safely reclaims nothing and returns 0.
+     */
+    hasObservers?(handle: unknown): boolean;
 }
 
 /** The registry-bound projection primitives returned by {@link createProjector}. */
@@ -185,3 +215,42 @@ export function projectRoom(
     room: RoomLike,
     opts?: ProjectRoomOptions,
 ): Projection<string, unknown>;
+
+/** The subset of a @zakkster/lite-query client that {@link projectQuery} consumes. */
+export interface QueryClientLike {
+    /** Non-reactive cache peek for a key. */
+    getQueryData(key: unknown): unknown;
+    /** Write a key's data; an updater function receives the previous value. */
+    setQueryData(key: unknown, valueOrUpdater: unknown | ((prev: unknown) => unknown)): unknown;
+}
+
+/** Options for {@link projectQuery}. */
+export interface ProjectQueryOptions<V extends object = Record<PropertyKey, unknown>> {
+    /**
+     * The query's reactive data accessor (e.g. `query.data`). When supplied,
+     * projected reads track the cache and auto-reconcile is armed. Omit to degrade
+     * to a non-reactive `getQueryData` snapshot with no auto-reconcile.
+     */
+    data?: () => V | null | undefined;
+    /** Reconciliation policy for auto-reconcile; defaults to {@link confirmOnEcho}. */
+    policy?: ReconcilePolicy<keyof V, unknown>;
+    /** Fold staged field overlays into the record; defaults to a shallow spread `{ ...prev, ...overlays }`. */
+    merge?: (prev: V | null | undefined, overlays: Partial<V>) => V;
+}
+
+/**
+ * Project ONE @zakkster/lite-query entry's data object as a DRAFT overlay whose
+ * projected keys are the FIELDS of that object. `set(field, v)` stages a draft;
+ * `commit()` promotes every staged field into the cache as a SINGLE
+ * `setQueryData(key, prev => merge(prev, overlays))` write (`commit(field)` writes
+ * one). When `opts.data` is supplied, reads track the cache and an auto-reconcile
+ * drops drafts the authoritative record catches up to while leaving conflicts
+ * masked. The query client is consumed structurally, so there is no hard
+ * dependency on lite-query. The returned handle's `dispose()` also stops the
+ * reconcile effect.
+ */
+export function projectQuery<V extends object = Record<PropertyKey, unknown>>(
+    qc: QueryClientLike,
+    key: unknown,
+    opts?: ProjectQueryOptions<V>,
+): Projection<keyof V, unknown>;

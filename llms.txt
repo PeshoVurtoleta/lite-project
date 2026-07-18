@@ -32,7 +32,14 @@ Peer dependency: @zakkster/lite-signal ^1.5.0 (uses createRoot). ESM only. MIT.
 get(key) | set(key,value) | clear(key) | commit(key?) [one key or all] | revert() |
 dirtyCount() [TRACKED reactive] | isDirty() [TRACKED reactive] |
 isOverlaid(key) | overlaidCount() | peek(key) [untracked effective read] |
-forEachOverlay(fn) | reconcileAll(policy?) | dispose() [recycle all owned nodes]
+forEachOverlay(fn) | reconcileAll(policy?) | dispose() [recycle all owned nodes] |
+prune() -> number [1.1] [release slots that are BOTH un-overlaid AND unobserved;
+  returns how many were freed. A slot = 1 overlay signal + 1 projected computed,
+  created by the first READ of a key and retained until dispose() (its computed may
+  have subscribers), so commit()/revert() reclaim nothing. Cold path: viewport change
+  or post-commit, never per frame. O(slots). Needs registry.hasObservers; without it
+  returns 0 rather than throwing. A pruned key rebuilds on next read. Present on the
+  projectStore/projectRoom/projectQuery handles too.]
 
 ## Source = any { get(key): reactive, set(key, value) }
 
@@ -58,6 +65,25 @@ forEachOverlay(fn) | reconcileAll(policy?) | dispose() [recycle all owned nodes]
                                  // drafts via the coarse `entries` signal; conflicts
                                  // stay masked. dispose() stops the reconcile effect.
                                  // CRDT owns the merge; the projection never joins it.
+- projectQuery(qc, key, opts?)   // [1.1] lite-query entry. Projects ONE record's
+                                 // FIELDS as draft keys. opts = {data?, policy?, merge?}.
+                                 // set(field,v) stages a draft (cache untouched);
+                                 // commit() folds ALL staged fields into the cache in a
+                                 // SINGLE setQueryData(key, prev => merge(prev, overlays))
+                                 // write (commit(field) writes one). data = the query's
+                                 // reactive data accessor (e.g. query.data) -> reactive
+                                 // reads + auto-reconcile (echo drops confirmed drafts,
+                                 // conflicts masked); OMIT data -> non-reactive
+                                 // getQueryData snapshot, no auto-reconcile. merge default
+                                 // = {...prev,...overlays} (nullish prev seeds a record).
+                                 // qc consumed structurally (getQueryData/setQueryData);
+                                 // no hard lite-query dep. dispose() stops the effect.
+                                 // Default merge copies OWN ENUMERABLE props (symbols
+                                 // included) and DEFINES them (never out[k]=v): a field
+                                 // named "__proto__" lands as a real own key instead of
+                                 // retargeting the prototype, inherited props on prev are
+                                 // not absorbed, and symbol-keyed drafts survive commit.
+                                 // A custom merge owns all three concerns itself.
 
 ## Zero-GC
 

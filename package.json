@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-project",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Zero-GC projections for @zakkster/lite-signal: granular, derived, non-mutating reactive overlays with commit / revert / reconcile, and draft adapters for lite-store and lite-room.",
   "type": "module",
   "main": "./Project.js",
@@ -24,10 +24,11 @@
     "LICENSE.txt"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "test:torture": "node bench/torture/overlay-fuzzer.mjs"
   },
   "peerDependencies": {
-    "@zakkster/lite-signal": ">=1.5.0-alpha"
+    "@zakkster/lite-signal": "^1.6.0-preview.2"
   },
   "keywords": [
     "reactive",
@@ -38,7 +39,12 @@
     "overlay",
     "zero-gc",
     "esm",
-    "lite-signal"
+    "lite-signal",
+    "query",
+    "tanstack-query",
+    "lite-query",
+    "cache",
+    "commit"
   ],
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
   "license": "MIT",

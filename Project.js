@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-project v1.0.0 -- zero-GC projections for @zakkster/lite-signal.
+ * @zakkster/lite-project v1.1.0 -- zero-GC projections for @zakkster/lite-signal.
  * -----------------------------------------------------------------------------
  * A projection is a granular, derived, NON-MUTATING reactive view over a keyed
  * source: a lens that can carry ephemeral overlays (optimistic edits, merges,
@@ -56,6 +56,7 @@ import {
     untrack as _untrack,
     effect as _effect,
     batch as _batch,
+    hasObservers as _hasObservers,
 } from "@zakkster/lite-signal";
 
 // Module-level sentinel for "this key has no overlay". A unique symbol, never a
@@ -74,6 +75,9 @@ const ABSENT = Symbol("projection.absent");
 export function createProjector(reg) {
     const signal = reg.signal;
     const computed = reg.computed;
+    // Optional: only prune() needs it. A custom registry that does not provide it
+    // simply gets a prune() that reclaims nothing rather than a crash.
+    const hasObservers = reg.hasObservers;
     const createRoot = reg.createRoot;
     const dispose = reg.dispose;
     const untrack = reg.untrack;
@@ -258,6 +262,42 @@ export function createProjector(reg) {
                     if (changed) { dirty = 0; dirtySig.set(0); }
                 });
             },
+            /**
+             * Reclaim slots for keys that are no longer in use.
+             *
+             * A slot is created by the first READ of a key and retained until
+             * dispose(), because its computed may have live subscribers. Over a
+             * large or unbounded keyspace -- a virtualised list, a query whose
+             * record churns, a projection driven by user input -- that is real
+             * growth: 20,000 reads retained 60,000 nodes, and neither commit()
+             * nor revert() gave any of them back.
+             *
+             * A slot is only safe to drop when it is BOTH un-overlaid (no staged
+             * value to lose) and unobserved (no consumer's computed/effect is
+             * subscribed to its read). `hasObservers` is what makes the second
+             * half checkable; without it, pruning could dispose a computed out
+             * from under a live subscriber.
+             *
+             * Cold path -- call it on a viewport change or after a commit, not
+             * per frame. O(slots).
+             *
+             * @returns {number} how many slots were released.
+             */
+            prune: () => {
+                if (typeof hasObservers !== "function") return 0;
+                let n = 0;
+                for (const [key, s] of slots) {
+                    if (s.ov.peek() !== ABSENT) continue;      // a staged draft would be lost
+                    // Only the READ computed's observers matter. `ov` is private to
+                    // the slot and is always observed by that very computed, so
+                    // testing it too would make prune() a permanent no-op.
+                    if (hasObservers(s.read)) continue;        // a consumer is subscribed
+                    dispose(s.read); dispose(s.ov);
+                    slots.delete(key);
+                    n++;
+                }
+                return n;
+            },
             dispose: () => {
                 // createRoot left these unowned, so nothing auto-disposes them.
                 // Dispose the computed before its overlay so the read never re-evaluates
@@ -282,6 +322,7 @@ const _default = createProjector({
     dispose: _dispose,
     untrack: _untrack,
     batch: _batch,
+    hasObservers: _hasObservers,
 });
 
 export const project = _default.project;
@@ -415,5 +456,149 @@ export function projectRoom(room, opts) {
     return {
         ...view,
         dispose: () => { stopReconcile(); view.dispose(); },
+    };
+}
+
+/**
+ * Copy one own enumerable property WITHOUT going through assignment.
+ * `out[k] = v` retargets the prototype when k is "__proto__" instead of creating
+ * an own key, so the field silently vanishes. defineProperty creates a real own
+ * key and leaves Object.prototype alone, so the merged record still has a normal
+ * prototype for consumers that deepStrictEqual it.
+ * @private
+ */
+function _put(out, k, v) {
+    Object.defineProperty(out, k, { value: v, writable: true, enumerable: true, configurable: true });
+}
+
+/**
+ * Default merge for projectQuery's commit.
+ *
+ * Iterates OWN keys only, symbols included. `for...in` was wrong on both counts:
+ *
+ *  - It walks the prototype chain. Combined with the assignment bug above, a
+ *    draft field named "__proto__" did not merely disappear -- `overlays.__proto__
+ *    = {pwned:1}` set the overlay bag's PROTOTYPE, and `for...in` then enumerated
+ *    that object's keys, so committing a "__proto__" draft INJECTED `pwned` as a
+ *    top-level field of the record. Own-keys iteration plus _put closes both ends.
+ *  - It skips symbols. project() keys are PropertyKey and slots live in a Map, so
+ *    a symbol-keyed draft staged fine, reported dirty, then evaporated on commit
+ *    while dirtyCount fell to 0 -- a "saved" signal for a value that never landed.
+ * @private
+ */
+const _ownEnumerableKeys = (o) => {
+    const keys = Object.keys(o);
+    const syms = Object.getOwnPropertySymbols(o);
+    for (let i = 0; i < syms.length; i++) {
+        if (Object.prototype.propertyIsEnumerable.call(o, syms[i])) keys.push(syms[i]);
+    }
+    return keys;
+};
+
+const _spreadMerge = (prev, overlays) => {
+    const out = {};
+    if (prev != null) {
+        const pk = _ownEnumerableKeys(prev);
+        for (let i = 0; i < pk.length; i++) _put(out, pk[i], prev[pk[i]]);
+    }
+    const ok = _ownEnumerableKeys(overlays);
+    for (let i = 0; i < ok.length; i++) _put(out, ok[i], overlays[ok[i]]);
+    return out;
+};
+
+/**
+ * Project ONE @zakkster/lite-query entry's data object as a DRAFT overlay whose
+ * projected keys are the FIELDS of that object. This is the optimistic-edit
+ * layer for a fetched record: stage field drafts locally, then commit them back
+ * into the query cache as a SINGLE `setQueryData` write (one cache mutation, one
+ * broadcast, one refetch-eligible change) rather than one write per field.
+ *
+ *   - get(field)       reactive read: the draft if staged, else the query field
+ *   - set(field, v)    stage a draft -- the query cache is NOT touched
+ *   - commit(field?)   promote drafts into the cache via ONE setQueryData(key, prev
+ *                      => merge(prev, overlays)); commit() writes all, commit(f) one
+ *   - revert()         discard drafts
+ *   - auto-reconcile   when `opts.data` is supplied, a refetch / external cache
+ *                      write that the policy considers confirmed drops the matching
+ *                      drafts; a CONFLICTING authoritative value leaves the draft
+ *                      masked (the engine's Object.is short-circuit suppresses the
+ *                      flicker), exactly as in projectRoom
+ *
+ * Reactivity depends on `opts.data`: pass the query's reactive data accessor
+ * (e.g. `query.data` from lite-query's `createQuery`) so projected reads track
+ * the cache and auto-reconcile is armed. WITHOUT it the adapter degrades to a
+ * non-reactive `qc.getQueryData(key)` snapshot for the base read (drafts are
+ * still reactive through their overlay signals, but the underlying record is not
+ * tracked and there is no auto-reconcile).
+ *
+ * The query client is consumed structurally -- any object exposing
+ * `getQueryData(key)` and `setQueryData(key, valueOrUpdater)` works -- so this
+ * adapter adds no hard dependency on lite-query.
+ *
+ * @param {{getQueryData:Function, setQueryData:Function}} qc A lite-query client.
+ * @param {PropertyKey|Array<unknown>} key The query key whose record is projected.
+ * @param {{
+ *   data?: () => (Record<PropertyKey, unknown> | null | undefined),
+ *   policy?: (authoritative:unknown, draft:unknown, key:PropertyKey)=>boolean,
+ *   merge?: (prev:(Record<PropertyKey,unknown>|null|undefined), overlays:Record<PropertyKey,unknown>)=>Record<PropertyKey,unknown>,
+ * }} [opts]
+ * @returns {object} A projection handle whose commit() writes the cache once and
+ *          whose dispose() also stops the reconcile effect.
+ */
+export function projectQuery(qc, key, opts) {
+    if (qc == null || typeof qc.getQueryData !== "function" || typeof qc.setQueryData !== "function") {
+        throw new TypeError("projectQuery: qc must expose getQueryData(key) and setQueryData(key, valueOrUpdater)");
+    }
+    const data = opts && typeof opts.data === "function" ? opts.data : null;
+    const policy = (opts && opts.policy) || confirmOnEcho;
+    const merge = (opts && opts.merge) || _spreadMerge;
+
+    // Reactive when `data` is supplied (tracks the query accessor); otherwise a
+    // non-reactive cache peek. `set` is only reached if a caller drives the base
+    // commit path directly; the overridden commit() below never uses it.
+    const source = {
+        get: (field) => {
+            const rec = data ? data() : qc.getQueryData(key);
+            return rec == null ? undefined : rec[field];
+        },
+        set: (field, v) => qc.setQueryData(key, (prev) => {
+            const one = Object.create(null);
+            _put(one, field, v);
+            return merge(prev, one);
+        }),
+    };
+    const view = project(source);
+
+    // Auto-reconcile: only meaningful when the record read is reactive. Tracks
+    // `data()` (never the overlays), so clearing drafts inside reconcileAll does
+    // not re-trigger it -> no loop. Mirrors projectRoom.
+    const stopReconcile = data
+        ? _effect(() => { data(); view.reconcileAll(policy); })
+        : null;
+
+    return {
+        ...view,
+        // One cache write for the whole burst of field drafts.
+        commit: (field) => {
+            if (field !== undefined) {
+                if (!view.isOverlaid(field)) return;
+                const v = view.peek(field);
+                const one = Object.create(null);
+                _put(one, field, v);
+                qc.setQueryData(key, (prev) => merge(prev, one));
+                view.clear(field);
+                return;
+            }
+            // Null-prototype bag: `overlays["__proto__"] = v` on a plain object
+            // sets the prototype instead of creating a key, which is how a
+            // "__proto__" draft used to turn into field injection downstream.
+            const overlays = Object.create(null);
+            let any = false;
+            view.forEachOverlay((f, v) => { _put(overlays, f, v); any = true; });
+            if (!any) return;
+            qc.setQueryData(key, (prev) => merge(prev, overlays));
+            view.revert();
+        },
+        dispose: () => { if (stopReconcile) stopReconcile(); view.dispose(); },
     };
 }

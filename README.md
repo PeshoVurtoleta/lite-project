@@ -83,6 +83,10 @@ Updating the dirty count is allocation-free (a single fixed signal per projectio
 
 In steady state the projection allocates nothing: toggling an overlay on a key you have already touched reuses its pooled nodes (verified — 200k overlay toggles on warmed keys leave `poolGrowths` and `totalAllocations` flat). The honest non-claim: the *first* touch of a **new** key allocates a slot record, a Map entry, and two pooled nodes (one overlay signal, one projected computed). Warm the keys you churn.
 
+**Slots outlive `commit()` and `revert()`.** A slot is created by the first *read* of a key and retained until `dispose()`, because its projected computed may still have subscribers — clearing an overlay does not release it. Over a bounded keyspace (a form, a settings panel) that is exactly the point: the nodes are there to be reused. Over a large or unbounded one — a virtualised list, a record whose fields churn, a projection driven by user input — it is real growth that neither `commit()` nor `revert()` gives back.
+
+`prune()` <sub>1.1</sub> is the reclamation path. It releases only slots that are **both** un-overlaid (no staged value to lose) and unobserved (no live consumer subscribed to the projected read), so it can never pull a computed out from under a subscriber; a pruned key rebuilds transparently on its next read. It is a cold path — call it on a viewport change or after a commit, never per frame — and it is `O(slots)`. It needs `hasObservers` from the registry to tell an unused slot from a watched one; a custom registry without it gets a `prune()` that safely reclaims nothing and returns `0`.
+
 ## API
 
 ### `createProjector(reg) -> { project, keyedStore }`
@@ -107,6 +111,7 @@ Bind the primitives to a lite-signal registry. Pass the default namespace for no
 | `peek(key)` | untracked effective read (no subscribe) |
 | `forEachOverlay(fn)` | iterate overlaid keys + values (untracked) |
 | `reconcileAll(policy?)` | drop overlays the policy confirms against the current source |
+| `prune()` | release slots for keys that are neither overlaid nor observed; returns how many were freed <sub>1.1</sub> |
 | `dispose()` | recycle every projection-owned node back to the pool |
 
 ### `keyedStore(initial?) -> { get, set, has, keys }`
@@ -152,6 +157,23 @@ draft.commit();                    // promotes via room.storage.set (writes + sy
 ```
 
 Room storage is authoritative and CRDT-merged, so the projection is **presentation-only**: it never joins the merge. `set` stages a local draft, `commit()` promotes it through `room.storage.set`, and an auto-reconcile drops drafts once the authoritative value catches up (echo) while leaving a conflicting authoritative value **masked** (no flicker). Because `room.storage` is coarse (a single `entries` signal, a plain non-reactive `get`), the adapter subscribes through `entries()` and the projection inherits that coarse granularity. Call `dispose()` to stop the reconcile effect. Only `room.storage` is projectable this way; sets / lists / texts have non-keyed shapes.
+
+### `projectQuery(qc, key, { data, policy, merge })` — optimistic field drafts over [lite-query](https://www.npmjs.com/package/@zakkster/lite-query)
+
+```js
+import { projectQuery } from "@zakkster/lite-project";
+
+const query = qc.createQuery(["user", id], fetchUser);
+const draft = projectQuery(qc, ["user", id], { data: query.data });
+
+draft.set("name", "Ada");          // optimistic field edit, cache untouched
+draft.set("email", "ada@x.dev");
+draft.commit();                    // ONE setQueryData merging both fields back in
+```
+
+Projects a single query entry's data **object**, exposing its **fields** as the projected keys. `commit()` folds every staged field into the cached record in a **single** `setQueryData(key, prev => merge(prev, overlays))` write (one cache mutation, one broadcast), rather than one write per field; `commit(field)` writes just one. Pass the query's reactive `data` accessor so reads track the cache and an auto-reconcile drops drafts a refetch confirms (echo) while masking conflicts — omit it to degrade to a non-reactive `getQueryData` snapshot with no auto-reconcile. `merge` defaults to a shallow spread (a nullish `prev` seeds a fresh record); `policy` defaults to `confirmOnEcho`. The client is consumed structurally (`getQueryData` / `setQueryData`), so there's no hard dependency on lite-query. `dispose()` stops the reconcile effect.
+
+The default merge copies **own enumerable** properties, symbols included, and defines them rather than assigning them. That matters for three field names you would otherwise lose silently: a field literally called `__proto__` lands as a real own key (assignment would retarget the prototype and drop it), inherited properties on `prev` are not absorbed into the record, and a symbol-keyed draft survives the commit instead of evaporating while `dirtyCount()` reports it saved. A custom `merge` is on its own for all three.
 
 ## Conventions
 
