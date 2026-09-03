@@ -59,6 +59,8 @@ import {
     hasObservers as _hasObservers,
 } from "@zakkster/lite-signal";
 
+export const VERSION = "1.1.0";
+
 // Module-level sentinel for "this key has no overlay". A unique symbol, never a
 // per-operation allocation. Stored directly in the overlay signal's value slot, so
 // "absent" and "present with value V" share one node and one field -- no boxing.

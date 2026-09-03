@@ -2,6 +2,8 @@
 // Zero-GC projections for @zakkster/lite-signal.
 // (c) 2026 Zahary Shinikchiev <shinikchiev@yahoo.com> -- MIT
 
+export const VERSION: string;
+
 /**
  * A reactive keyed source a projection can wrap. Any object with a reactive
  * `get(key)` and a `set(key, value)` qualifies (the built-in `keyedStore`, a

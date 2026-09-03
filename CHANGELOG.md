@@ -3,6 +3,41 @@
 All notable changes to `@zakkster/lite-project` are documented here. The format
 follows Keep a Changelog; this project adheres to semantic versioning.
 
+## [1.1.1] - 2026-09-03
+
+### Changed
+
+- Peer dependency floor is now `@zakkster/lite-signal ^1.5.0` (was a pinned
+  preview build). No behaviour change: 1.5.0 is the current stable line and
+  supplies every surface this package uses (`batch` 1.0.0, `hasObservers` 1.1.4,
+  `createRoot` 1.5.0).
+
+### Added
+
+- **`VERSION`** export from `Project.js` (declared in `Project.d.ts`), kept in
+  exact sync with `package.json`, so a consumer can read the shipped version at
+  runtime.
+- Gated torture harness under `test/torture/` (dev-only; not shipped). Seven
+  tiers run strictly sequentially behind `node --expose-gc test/torture.mjs`:
+  T0 metamorphic laws, T1 degenerate inputs, T4 reconcile door, T5 oracle fuzz,
+  T6 zero-alloc gate, T7 retention soak, T9 controls. Gate RULES:
+  `maxMajor 0`, `maxPauseMs 4`, `maxArrayBuffersGrowth 0` under `stabilize:"deep"`.
+  Witnessed on a green run (default seed):
+  `leak=size 0/0 findings=0 warnings=0 | gc major=0 minor=0 maxMs=0.00 |
+  retained=0.00 B/op growths=0`
+  (the `alloc=` per-op heap-bracket reading prints as-is, `n/a` when
+  inconclusive; the binding alloc gates are `checkNoGc`, the zero-retention
+  gate below, and the structural deltas below).
+  The get/set/clear triangle on warmed keys leaves `poolGrowths` and
+  `totalAllocations` deltas both 0 over 200k toggles; 4096 build/tear-down cycles
+  return the leak tracker to `size()===0`; `prune()` reclaims >= 19990 of 20000
+  unbounded-read slots.
+- Retained-allocation gate (`measureAllocs` + `checkAllocs` with
+  `maxBytesPerCall: 0`, the profiler's zero-retention assertion): the warmed
+  get/set/clear triangle retains 0 B/call (min over 8 batches), catching
+  arbitrary JS-object retention that the asynchronously-delivered `gc.major`
+  count cannot see; an unsettled or inconclusive reading fails the gate.
+
 ## [1.1.0] - 2026-07-16
 
 ### Added

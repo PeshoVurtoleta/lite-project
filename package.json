@@ -24,11 +24,18 @@
     "LICENSE.txt"
   ],
   "scripts": {
-    "test": "node --test",
-    "test:torture": "node bench/torture/overlay-fuzzer.mjs"
+    "test": "node --test test/*_test.mjs",
+    "torture": "node --expose-gc test/torture.mjs",
+    "verify": "npm test && npm run torture",
+    "prepublishOnly": "npm run verify"
   },
   "peerDependencies": {
-    "@zakkster/lite-signal": "^1.6.0-preview.2"
+    "@zakkster/lite-signal": "^1.5.0"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0",
+    "@zakkster/lite-signal": "^1.5.0"
   },
   "keywords": [
     "reactive",
@@ -53,6 +60,10 @@
     "url": "git+https://github.com/PeshoVurtoleta/lite-project.git"
   },
   "homepage": "https://github.com/PeshoVurtoleta/lite-project#readme",
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-project/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
   "funding": {
     "type": "github",
     "url": "https://github.com/sponsors/PeshoVurtoleta"
