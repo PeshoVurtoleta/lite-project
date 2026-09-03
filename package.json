@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-project",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Zero-GC projections for @zakkster/lite-signal: granular, derived, non-mutating reactive overlays with commit / revert / reconcile, and draft adapters for lite-store and lite-room.",
   "type": "module",
   "main": "./Project.js",

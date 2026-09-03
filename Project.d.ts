@@ -1,4 +1,4 @@
-// Type declarations for @zakkster/lite-project v1.1.0
+// Type declarations for @zakkster/lite-project v1.1.1
 // Zero-GC projections for @zakkster/lite-signal.
 // (c) 2026 Zahary Shinikchiev <shinikchiev@yahoo.com> -- MIT
 

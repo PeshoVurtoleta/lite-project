@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-project v1.1.0 -- zero-GC projections for @zakkster/lite-signal.
+ * @zakkster/lite-project v1.1.1 -- zero-GC projections for @zakkster/lite-signal.
  * -----------------------------------------------------------------------------
  * A projection is a granular, derived, NON-MUTATING reactive view over a keyed
  * source: a lens that can carry ephemeral overlays (optimistic edits, merges,
@@ -59,7 +59,7 @@ import {
     hasObservers as _hasObservers,
 } from "@zakkster/lite-signal";
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.1.1";
 
 // Module-level sentinel for "this key has no overlay". A unique symbol, never a
 // per-operation allocation. Stored directly in the overlay signal's value slot, so

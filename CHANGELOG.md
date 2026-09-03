@@ -5,13 +5,6 @@ follows Keep a Changelog; this project adheres to semantic versioning.
 
 ## [1.1.1] - 2026-09-03
 
-### Changed
-
-- Peer dependency floor is now `@zakkster/lite-signal ^1.5.0` (was a pinned
-  preview build). No behaviour change: 1.5.0 is the current stable line and
-  supplies every surface this package uses (`batch` 1.0.0, `hasObservers` 1.1.4,
-  `createRoot` 1.5.0).
-
 ### Added
 
 - **`VERSION`** export from `Project.js` (declared in `Project.d.ts`), kept in
@@ -37,6 +30,13 @@ follows Keep a Changelog; this project adheres to semantic versioning.
   get/set/clear triangle retains 0 B/call (min over 8 batches), catching
   arbitrary JS-object retention that the asynchronously-delivered `gc.major`
   count cannot see; an unsettled or inconclusive reading fails the gate.
+
+### Changed
+
+- Peer dependency floor is now `@zakkster/lite-signal ^1.5.0` (was a pinned
+  preview build). No behaviour change: 1.5.0 is the current stable line and
+  supplies every surface this package uses (`batch` 1.0.0, `hasObservers` 1.1.4,
+  `createRoot` 1.5.0).
 
 ## [1.1.0] - 2026-07-16
 
