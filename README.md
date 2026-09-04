@@ -110,6 +110,8 @@ Bind the primitives to a lite-signal registry. Pass the default namespace for no
 | `overlaidCount()` | untracked diagnostic: number of overlaid keys |
 | `peek(key)` | untracked effective read (no subscribe) |
 | `forEachOverlay(fn)` | iterate overlaid keys + values (untracked) |
+| `forEachPatch(fn, skip?)` | emit staged drafts as a `(key, from, to)` stream (untracked, read-only, zero-alloc per key) <sub>1.2</sub> |
+| `toPatch(skip?)` | materialize the drafts as `[{ key, from, to }, ...]` (cold convenience over `forEachPatch`) <sub>1.2</sub> |
 | `reconcileAll(policy?)` | drop overlays the policy confirms against the current source |
 | `prune()` | release slots for keys that are neither overlaid nor observed; returns how many were freed <sub>1.1</sub> |
 | `dispose()` | recycle every projection-owned node back to the pool |
@@ -174,6 +176,30 @@ draft.commit();                    // ONE setQueryData merging both fields back 
 Projects a single query entry's data **object**, exposing its **fields** as the projected keys. `commit()` folds every staged field into the cached record in a **single** `setQueryData(key, prev => merge(prev, overlays))` write (one cache mutation, one broadcast), rather than one write per field; `commit(field)` writes just one. Pass the query's reactive `data` accessor so reads track the cache and an auto-reconcile drops drafts a refetch confirms (echo) while masking conflicts — omit it to degrade to a non-reactive `getQueryData` snapshot with no auto-reconcile. `merge` defaults to a shallow spread (a nullish `prev` seeds a fresh record); `policy` defaults to `confirmOnEcho`. The client is consumed structurally (`getQueryData` / `setQueryData`), so there's no hard dependency on lite-query. `dispose()` stops the reconcile effect.
 
 The default merge copies **own enumerable** properties, symbols included, and defines them rather than assigning them. That matters for three field names you would otherwise lose silently: a field literally called `__proto__` lands as a real own key (assignment would retarget the prototype and drop it), inherited properties on `prev` are not absorbed into the record, and a symbol-keyed draft survives the commit instead of evaporating while `dirtyCount()` reports it saved. A custom `merge` is on its own for all three.
+
+## Patch emission <sub>1.2</sub>
+
+The overlay bag already knows every staged draft's `to`; `forEachPatch` adds the source's `from` so a draft can cross the wire without re-walking the view.
+
+```js
+const draft = project(source);
+draft.set("name", "Ada");
+draft.set("email", "ada@x.dev");
+
+// Zero-alloc callback: hand each draft to a serializer / transport.
+draft.forEachPatch((key, from, to) => {
+  wire.send({ op: "set", key, prev: from, next: to });
+});
+
+// Cold convenience: materialize the same deltas as an array.
+const patch = draft.toPatch();   // [{ key: "name", from: undefined, to: "Ada" }, ...]
+```
+
+`from` is the **untracked** current source value, `to` the staged overlay. Both methods are read-only and untracked -- calling them inside an effect subscribes it to nothing -- and visit exactly the overlaid keys, in `forEachOverlay` order. `forEachPatch` allocates nothing per key; `toPatch` is the cold convenience whose per-key record is its documented allocation.
+
+An overlaid key is emitted whether or not `Object.is(from, to)`: the visit set stays equal to `dirtyCount()` and `commit()`'s write set, so a patch consumer (an LWW-Map op, a CRDT bump, an HTTP PATCH field) is never silently dropped. To suppress unchanged drafts, pass the same predicate shape reconcile uses -> `draft.forEachPatch(fn, confirmOnEcho)`. A throwing `source.get` propagates on the offending key with the overlay bag intact; callers needing atomicity use `toPatch()` (a partial array never escapes). The patch and `commit()` are two views of one delta: applying `toPatch()` to a copy of the source yields the same state `commit()` would write.
+
+Present on the `projectStore` / `projectRoom` / `projectQuery` handles too (for `projectQuery`, `from` is the cached record's field value).
 
 ## Conventions
 

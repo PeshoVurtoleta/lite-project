@@ -76,5 +76,29 @@ export function run() {
     metrics.allocRetainedBytesPerCall =
         typeof allocs.bytesPerCall === "number" ? allocs.bytesPerCall : null;
 
+    // -- Proof 4: the patch gate. forEachPatch over a warm overlaid set passes
+    // both the heap gate and the zero-retention gate at the SAME strict rules.
+    // The emit callback is hoisted OUTSIDE the measured body (a per-visit closure
+    // would be the caller's allocation, not the library's -- that is T9's control).
+    // Smaller loops than the triangle: the body visits every slot per call, so
+    // the run stays fast. Proof 4 asserts only -- it does NOT overwrite
+    // metrics.allocBytesPerOp / metrics.allocRetainedBytesPerCall (those carry
+    // the triangle numbers the GATE line + CHANGELOG quote).
+    const P = 32;
+    for (let i = 0; i < P; i++) v.set(keys[i], -i - 1);   // bounded overlaid set
+    let acc = 0;
+    const emit = (k, f, t) => { acc += 1; };
+    const patchGate = runOpsGate((i) => v.forEachPatch(emit), { ops: 20000, warmup: 4000 });
+    check(patchGate.report.ok,
+        () => "T6 forEachPatch failed the zero-alloc gate: " +
+            patchGate.report.verdict + " " + JSON.stringify(patchGate.report.violations));
+    recordGc(patchGate.summary);
+    const patchAllocs = runAllocsGate((i) => v.forEachPatch(emit), { iterations: 4000, batches: 8 });
+    check(patchAllocs.ok,
+        () => "T6 forEachPatch failed the zero-retention gate: verdict=" + patchAllocs.report.verdict +
+            " settled=" + patchAllocs.result.settled + " bytesPerCall=" + patchAllocs.bytesPerCall +
+            " " + JSON.stringify(patchAllocs.report.violations));
+    void acc;
+
     v.dispose();
 }

@@ -1,4 +1,4 @@
-// Type declarations for @zakkster/lite-project v1.1.1
+// Type declarations for @zakkster/lite-project v1.2.0
 // Zero-GC projections for @zakkster/lite-signal.
 // (c) 2026 Zahary Shinikchiev <shinikchiev@yahoo.com> -- MIT
 
@@ -24,6 +24,17 @@ export interface ProjectionSource<K extends PropertyKey = PropertyKey, V = unkno
  */
 export type ReconcilePolicy<K extends PropertyKey = PropertyKey, V = unknown> =
     (authoritative: V, overlayValue: V, key: K) => boolean;
+
+/**
+ * One staged draft as a patch entry: the current source value (`from`) and the
+ * staged overlay value (`to`) for `key`. The materialized shape returned by
+ * {@link Projection.toPatch}.
+ */
+export interface Patch<K extends PropertyKey = PropertyKey, V = unknown> {
+    key: K;
+    from: V;
+    to: V;
+}
 
 /**
  * A projection handle: a granular, derived, non-mutating draft overlay over a
@@ -53,6 +64,26 @@ export interface Projection<K extends PropertyKey = PropertyKey, V = unknown> {
     peek(key: K): V;
     /** Iterate currently-overlaid keys with their overlay values (untracked). */
     forEachOverlay(fn: (key: K, value: V) => void): void;
+    /**
+     * Emit the staged drafts as a patch stream `fn(key, from, to)` -- `from` is
+     * the UNTRACKED current source value, `to` the staged overlay. Read-only and
+     * untracked: it touches neither the source nor the overlays and subscribes the
+     * caller to nothing, so it is safe inside an effect. Visits exactly the
+     * overlaid keys, in {@link Projection.forEachOverlay} order, with a zero-alloc
+     * per-key body. An overlaid key is emitted whether or not `Object.is(from, to)`
+     * (the visit set stays equal to `dirtyCount()`); pass `skip` -- the same
+     * predicate shape reconcile uses, e.g. {@link confirmOnEcho} -- to drop
+     * unchanged drafts. A throwing `source.get` propagates on that key with the
+     * overlay bag intact (callers needing atomicity use {@link Projection.toPatch}).
+     */
+    forEachPatch(fn: (key: K, from: V, to: V) => void, skip?: ReconcilePolicy<K, V>): void;
+    /**
+     * Cold convenience over {@link Projection.forEachPatch}: materialize the drafts
+     * as `[{ key, from, to }, ...]` -- same visit set, order, and values. The
+     * per-key record is this form's allocation; reach for `forEachPatch` when you
+     * need the zero-alloc callback.
+     */
+    toPatch(skip?: ReconcilePolicy<K, V>): Array<Patch<K, V>>;
     /**
      * Full-snapshot reconciliation: drop every overlay the policy considers
      * confirmed against the current (untracked) source value. Presentation-only --

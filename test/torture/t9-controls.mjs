@@ -115,4 +115,21 @@ export function run() {
         if (fg.ok) die("T9 (f): a plain-object retention loop passed the zero-retention gate (bytesPerCall=" + fg.bytesPerCall + ")");
         sink.length = 0;
     }
+
+    // (g) the retained-allocation gate must REJECT a forEachPatch emitter that
+    // builds a {key,from,to} record per visit into a retained sink -- the exact
+    // allocation Proof 4's hoisted emit avoids. Same runAllocsGate / ALLOC_RULES
+    // as the real gate, so the control can never drift from what it proves.
+    {
+        const src = keyedStore({});
+        const v = project(src);
+        for (let i = 0; i < 32; i++) v.set("g" + i, i);
+        const sink = [];
+        const gg = runAllocsGate(
+            (i) => v.forEachPatch((k, f, t) => sink.push({ key: k, from: f, to: t })),
+            { iterations: 4000, batches: 8 });
+        if (gg.ok) die("T9 (g): a per-visit-allocating forEachPatch emitter passed the zero-retention gate (bytesPerCall=" + gg.bytesPerCall + ")");
+        sink.length = 0;
+        v.dispose();
+    }
 }

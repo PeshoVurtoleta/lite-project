@@ -1,5 +1,5 @@
 /**
- * @zakkster/lite-project v1.1.1 -- zero-GC projections for @zakkster/lite-signal.
+ * @zakkster/lite-project v1.2.0 -- zero-GC projections for @zakkster/lite-signal.
  * -----------------------------------------------------------------------------
  * A projection is a granular, derived, NON-MUTATING reactive view over a keyed
  * source: a lens that can carry ephemeral overlays (optimistic edits, merges,
@@ -20,6 +20,10 @@
  *                stays the overlay) and -- thanks to the engine's Object.is short-
  *                circuit -- does NOT churn downstream consumers. The optimistic value
  *                is stable under source noise.
+ *
+ * Patch emission (forEachPatch / toPatch) exposes the staged drafts as a
+ * (key, from, to) stream for a save/sync trigger. It is READ-ONLY and UNTRACKED:
+ * it never touches the source or the overlays and subscribes the caller to nothing.
  *
  * -- OWNERSHIP (why createRoot) --
  * Per-key nodes are created LAZILY, on the first get/set of a key -- which happens
@@ -59,7 +63,7 @@ import {
     hasObservers as _hasObservers,
 } from "@zakkster/lite-signal";
 
-export const VERSION = "1.1.1";
+export const VERSION = "1.2.0";
 
 // Module-level sentinel for "this key has no overlay". A unique symbol, never a
 // per-operation allocation. Stored directly in the overlay signal's value slot, so
@@ -129,6 +133,8 @@ export function createProjector(reg) {
      *   isDirty:()=>boolean,                     // TRACKED: any staged overlays? (reactive)
      *   peek:(key:PropertyKey)=>unknown,         // untracked effective read (no subscribe)
      *   forEachOverlay:(fn:(key:PropertyKey, value:unknown)=>void)=>void, // iterate overlaid keys (untracked)
+     *   forEachPatch:(fn:(key:PropertyKey, from:unknown, to:unknown)=>void, skip?:Function)=>void, // patch stream (untracked, read-only)
+     *   toPatch:(skip?:Function)=>Array<{key:PropertyKey, from:unknown, to:unknown}>, // materialized patch (cold convenience)
      *   reconcileAll:(policy?:(authoritative:unknown, overlayValue:unknown, key:PropertyKey)=>boolean)=>void, // drop confirmed overlays
      *   commit:(key?:PropertyKey)=>void,         // write one key's overlay, or all, into the source then clear
      *   revert:()=>void,                         // drop all overlays
@@ -160,6 +166,28 @@ export function createProjector(reg) {
             return s;
         };
 
+        // Patch emission: iterate exactly the overlaid keys, handing scalars
+        // (key, from, to) to `fn` -- `from` is the UNTRACKED current source value,
+        // `to` the staged overlay. Read-only: overlays via .peek(), source under
+        // untrack, so calling this inside an effect subscribes to nothing. The
+        // visit set / order is byte-identical to forEachOverlay. Optional `skip`
+        // reuses ReconcilePolicy: (from, to, key) => true drops that key from the
+        // stream (e.g. `forEachPatch(fn, confirmOnEcho)` skips echoes); default
+        // undefined emits every overlaid key, changed or not. A throwing
+        // source.get propagates on the offending key with no writes anywhere, so
+        // the overlay bag is intact by construction (fn may already have run for
+        // earlier keys; callers needing atomicity use toPatch()).
+        const forEachPatch = (fn, skip) => {
+            for (const [key, s] of slots) {
+                const to = s.ov.peek();
+                if (to === ABSENT) continue;
+                _pk = key;
+                const from = untrack(_readSrc);
+                if (skip !== undefined && skip(from, to, key)) continue;
+                fn(key, from, to);
+            }
+        };
+
         // Reactive dirty state. ONE fixed signal per projection (created detached so
         // dispose() owns its teardown, like the per-key nodes). `dirty` is the
         // source-of-truth count of staged overlays, mirrored into the signal on every
@@ -168,6 +196,12 @@ export function createProjector(reg) {
         // property holds even with a Save button subscribed to isDirty().
         const dirtySig = createRoot(() => signal(0));
         let dirty = 0;
+
+        // Hoisted scratch for forEachPatch's untracked source read: ONE closure
+        // per projection, never per key/call, so the per-key emit body allocates
+        // nothing. `untrack` needs a function; _readSrc is it.
+        let _pk;
+        const _readSrc = () => source.get(_pk);
 
         return {
             get: (key) => slotFor(key).read(),
@@ -207,6 +241,18 @@ export function createProjector(reg) {
                     const o = s.ov.peek();
                     if (o !== ABSENT) fn(key, o);
                 }
+            },
+            // Emit the overlaid keys as a patch stream fn(key, from, to). Untracked,
+            // read-only, zero-alloc per-key body. See forEachPatch above.
+            forEachPatch,
+            // Cold convenience over forEachPatch: materialize the drafts as
+            // [{ key, from, to }, ...] (same visit set, order, values). The
+            // per-key record is the documented allocation of this form; reach for
+            // forEachPatch when you need the zero-alloc callback.
+            toPatch: (skip) => {
+                const out = [];
+                forEachPatch((key, from, to) => { out.push({ key, from, to }); }, skip);
+                return out;
             },
             // Full-snapshot reconciliation: drop every overlay the policy considers
             // confirmed against the CURRENT (untracked) source value. For sources that

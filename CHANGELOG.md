@@ -3,6 +3,56 @@
 All notable changes to `@zakkster/lite-project` are documented here. The format
 follows Keep a Changelog; this project adheres to semantic versioning.
 
+## [1.2.0] - 2026-09-05
+
+### Added
+
+- **`Projection.forEachPatch(fn, skip?)`** -- emit the staged drafts as a
+  `(key, from, to)` stream, where `from` is the **untracked** current source
+  value and `to` the staged overlay. Read-only and untracked: it touches neither
+  the source nor the overlays and subscribes the caller to nothing, so it is safe
+  inside an effect. Visits exactly the overlaid keys, in `forEachOverlay` order,
+  with a **zero-allocation** per-key body (the source read is hoisted through one
+  closure per projection, never one per key). The optional `skip` reuses the
+  `ReconcilePolicy` shape `(from, to, key) => boolean` -- pass `confirmOnEcho` to
+  drop unchanged drafts. A throwing `source.get` propagates on the offending key
+  with the overlay bag intact (no writes happen anywhere in the call).
+- **`Projection.toPatch(skip?)`** -- the cold convenience that materializes the
+  same stream as `[{ key, from, to }, ...]` (same visit set, order, and values).
+  The per-key record is this form's documented allocation; reach for
+  `forEachPatch` when you need the zero-alloc callback. Both methods are present
+  on the `projectStore` / `projectRoom` / `projectQuery` handles (for
+  `projectQuery`, `from` is the cached record's field value; for `projectRoom`,
+  `room.storage.get`).
+- **`Patch<K, V>`** interface (`{ key, from, to }`) exported from `Project.d.ts`.
+
+  **The decision -- unchanged drafts are emitted by default.** An overlaid key is
+  emitted whether or not `Object.is(from, to)`. This keeps the visit set
+  definitionally equal to `forEachOverlay`, `dirtyCount()`, and `commit()`'s write
+  set, so `toPatch().length === dirtyCount()` always holds; a patch consumer is a
+  protocol (an LWW-Map op, a CRDT timestamp bump, an HTTP PATCH field), not a diff
+  viewer, so dropping an unchanged key would be silent data loss one layer out.
+  Callers who want the filter pass `forEachPatch(fn, confirmOnEcho)`. Recorded in
+  `decisions/0001-patch-emission.md` (dev-only; not shipped).
+
+### Verified
+
+- 17 new `test/patch_test.mjs` cases (visit-set exactness + order, from/to vs
+  source and overlay, `toPatch()` == the callback stream, the emit-by-default and
+  echo-skip pins, the tracking contract, `__proto__` / symbol / numeric keys,
+  `undefined` / `NaN` / `-0` under `Object.is`, fail-closed on a throwing
+  `source.get`, patch-apply == commit, and all four adapter handles); **84 tests
+  total**, `node --test`.
+- Torture green (default seed):
+  `leak=size 0/0 findings=0 warnings=0 | gc major=0 minor=0 maxMs=0.00 |
+  alloc=n/a retained=0.00 B/op growths=0`. T5 gains the metamorphic law (the
+  emitted patch applied to a fresh source copy == `commit()` into it, across the
+  fuzz corpus incl. object drafts). T6 gains Proof 4 -- `forEachPatch` over a
+  warm overlaid set passes both the heap gate (`maxMajor 0`, `maxPauseMs 4`,
+  `maxArrayBuffersGrowth 0`) and the zero-retention gate (`maxBytesPerCall 0`).
+  T9 gains control (g): a per-visit-allocating emitter body demonstrably trips the
+  retained-alloc gate through the same helper.
+
 ## [1.1.1] - 2026-09-03
 
 ### Added

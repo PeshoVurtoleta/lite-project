@@ -26,6 +26,7 @@ Peer dependency: @zakkster/lite-signal ^1.5.0 (uses createRoot). ESM only. MIT.
 - createProjector(reg) -> { project, keyedStore }   // bind to any lite-signal registry
 - project(source) -> Projection                       // default registry
 - keyedStore(initial?) -> { get, set, has, keys }     // minimal built-in source
+- VERSION -> string                                   // shipped package version, synced to package.json
 
 ## Projection handle
 
@@ -33,6 +34,16 @@ get(key) | set(key,value) | clear(key) | commit(key?) [one key or all] | revert(
 dirtyCount() [TRACKED reactive] | isDirty() [TRACKED reactive] |
 isOverlaid(key) | overlaidCount() | peek(key) [untracked effective read] |
 forEachOverlay(fn) | reconcileAll(policy?) | dispose() [recycle all owned nodes] |
+forEachPatch(fn, skip?) [1.2] | toPatch(skip?) -> [{key,from,to}] [1.2]
+  [patch emission: iterate exactly the overlaid keys as fn(key, from, to) -- from =
+  UNTRACKED current source value, to = staged overlay. Read-only + untracked: safe
+  inside an effect, subscribes to nothing. Same visit set/order as forEachOverlay,
+  zero-alloc per-key body. Emits UNCHANGED drafts by default (visit set stays equal
+  to dirtyCount()); pass a reconcile-policy predicate (from,to,key)=>bool, e.g.
+  confirmOnEcho, to skip echoes. A throwing source.get propagates on that key with
+  the overlay bag intact. toPatch() is the cold convenience that materializes the
+  stream (its per-key record is the documented allocation). Present on the
+  projectStore/projectRoom/projectQuery handles too.] |
 prune() -> number [1.1] [release slots that are BOTH un-overlaid AND unobserved;
   returns how many were freed. A slot = 1 overlay signal + 1 projected computed,
   created by the first READ of a key and retained until dispose() (its computed may

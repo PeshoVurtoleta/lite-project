@@ -41,9 +41,27 @@ function coreFuzz() {
                 v.commit(k);
                 if (oracle.ov.has(k)) { oracle.src.set(k, oracle.ov.get(k)); oracle.ov.delete(k); }
             } else if (op === 3) {
+                // Metamorphic law: the emitted patch applied to a fresh copy of
+                // the source produces the SAME state as commit() into it. `from`
+                // must equal the current source value at every emitted key.
+                const copy = new Map(oracle.src);
+                v.forEachPatch((pk, pf, pt) => {
+                    check(Object.is(pf, oracle.src.get(pk)),
+                        () => "T5 patch from " + String(pf) + " != source " + String(oracle.src.get(pk)) + " at " + String(pk));
+                    copy.set(pk, pt);
+                });
                 v.commit();
                 for (const [dk, dv] of oracle.ov) oracle.src.set(dk, dv);
                 oracle.ov.clear();
+                check(copy.size === oracle.src.size,
+                    () => "T5 patch/commit size " + copy.size + " != " + oracle.src.size);
+                for (const [dk, dv] of oracle.src) {
+                    check(copy.has(dk) && Object.is(copy.get(dk), dv),
+                        () => "T5 patch-apply != commit at " + String(dk));
+                }
+                for (const [dk] of copy) {
+                    check(oracle.src.has(dk), () => "T5 patch-apply produced extra key " + String(dk));
+                }
             } else if (op === 4) { v.revert(); oracle.ov.clear(); }
             else if (op === 5) {
                 const val = pick(prng); src.set(k, val); oracle.src.set(k, val); // authoritative write
