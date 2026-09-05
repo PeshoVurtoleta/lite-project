@@ -3,7 +3,7 @@
 All notable changes to `@zakkster/lite-project` are documented here. The format
 follows Keep a Changelog; this project adheres to semantic versioning.
 
-## Unreleased
+## [1.4.1] - 2026-09-05
 
 ### Fixed
 
