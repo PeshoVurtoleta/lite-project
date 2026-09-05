@@ -1,6 +1,11 @@
 /**
  * T6 -- the zero-alloc gate. On an ALREADY-TOUCHED key set, the get/set/clear
- * triangle allocates nothing the engine can avoid. Two independent proofs:
+ * triangle allocates nothing the engine can avoid. Independent proofs:
+ *   0. the TRANSIENT witness -- V8 new-space used-bytes delta over a GC-free
+ *      50k-op window per warm surface (get/peek/set/toggle/triangle), <= 16384 B
+ *      total each. The only lane that sees per-op garbage that never survives
+ *      a collection (proofs 1-6 are all blind to it; a ~40 B/op context
+ *      allocation passed them until 1.4.1).
  *   1. the heap gate (runOpsGate over the triangle) -- maxMajor 0, maxPauseMs 4,
  *      maxArrayBuffersGrowth 0 under stabilize:"deep";
  *   2. the structural gate the heap gate cannot make -- across 200k warmed
@@ -9,7 +14,7 @@
  */
 import { project, projectCRDT, keyedStore } from "../../Project.js";
 import { effect, signal } from "@zakkster/lite-signal";
-import { check, runOpsGate, runAllocsGate, graphSnapshot, graphDelta, metrics, recordGc, makeFakeMap } from "./harness.mjs";
+import { check, runOpsGate, runAllocsGate, allocTotal, graphSnapshot, graphDelta, metrics, recordGc, makeFakeMap } from "./harness.mjs";
 
 const N = 256;
 const MASK = N - 1;               // power-of-2 keyset, bitmask index
@@ -32,6 +37,40 @@ export function run() {
     const src = keyedStore(seed);
     const v = project(src);
     for (let i = 0; i < N; i++) v.get(keys[i]);
+
+    // -- Proof 0: the TRANSIENT witness (new-space delta) -------------------
+    // The one lane Proofs 1-6 cannot cover: per-op garbage that never survives
+    // a collection. Each warm per-op surface gets a GC-free 50k window; the
+    // whole window may allocate at most TRANSIENT_BUDGET bytes TOTAL (fixed
+    // measurement noise passes; any per-op cost fails). This is the gate that
+    // catches a context allocation from a closure in a hot function's cold
+    // branch -- 40 B/op sailed through Proofs 1-6 before 1.4.1.
+    const TOPS = 50000;
+    const TWARM = 5000;
+    const TRANSIENT_BUDGET = 16384;
+    const w = (name, total) => {
+        check(total <= TRANSIENT_BUDGET,
+            () => "T6 Proof 0 transient witness: warm " + name + " allocated " + total +
+                " B over " + TOPS + " ops (" + (total / TOPS).toFixed(3) +
+                " B/op, budget " + TRANSIENT_BUDGET + " B total)");
+        return total;
+    };
+    w("get", allocTotal((i) => { v.get(keys[i & MASK]); }, TOPS, TWARM));
+    w("peek", allocTotal((i) => { v.peek(keys[i & MASK]); }, TOPS, TWARM));
+    w("set", allocTotal((i) => { v.set(keys[i & MASK], (i & 1) ? "x" : "y"); }, TOPS, TWARM));
+    w("set/clear toggle", allocTotal((i) => {
+        const k = keys[i & MASK];
+        if (i & 1) v.clear(k); else v.set(k, i);
+    }, TOPS, TWARM));
+    const triangleTotal = w("get+set+clear triangle", allocTotal((i) => {
+        const k = keys[i & MASK];
+        v.get(k);
+        v.set(k, i);
+        v.clear(k);
+    }, TOPS, TWARM));
+    metrics.transientBytesPerOp = triangleTotal / TOPS;
+    // Leave every key un-overlaid for the proofs below (the set window staged all N).
+    v.revert();
 
     // -- Proof 1: the heap gate over the get/set/clear triangle -------------
     const gate = runOpsGate((i) => {

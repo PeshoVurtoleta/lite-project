@@ -68,6 +68,9 @@ async function main() {
         " retained=" + (typeof metrics.allocRetainedBytesPerCall === "number"
             ? metrics.allocRetainedBytesPerCall.toFixed(2) + " B/op"
             : "n/a") +
+        " transient=" + (typeof metrics.transientBytesPerOp === "number"
+            ? metrics.transientBytesPerOp.toFixed(3) + " B/op"
+            : "n/a") +
         " growths=" + metrics.poolGrowths + "\n");
 
     process.stdout.write("ok\n");

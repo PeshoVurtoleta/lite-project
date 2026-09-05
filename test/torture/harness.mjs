@@ -29,6 +29,7 @@
  * An untrustworthy retained figure (source could not settle every batch) routes
  * to inconclusive, which this harness treats as a FAIL -- never a skip.
  */
+import v8 from "node:v8";
 import { setDefaultRegistry, createRegistry, stats } from "@zakkster/lite-signal";
 import { measureOps, checkNoGc, measureAllocs, checkAllocs } from "@zakkster/lite-gc-profiler";
 
@@ -61,6 +62,47 @@ export function die(msg) {
     process.exit(1);
 }
 export function check(cond, msgThunk) { if (!cond) die(msgThunk()); }
+
+/* -- The transient witness ---------------------------------------------------
+ * Every other lane in this harness is blind to TRANSIENT garbage: the gc-
+ * profiler heap gate tolerates scavenges, the retained-bytes bracket measures
+ * what SURVIVES a collection (transient garbage survives nothing), and the pool
+ * census counts lite-signal nodes only (a plain closure/context/array is
+ * invisible to all three). A per-op context allocation -- e.g. a cold-branch
+ * closure capturing the hot function's parameter -- sailed through this whole
+ * suite at ~40 B/op until 1.4.1. The only honest witness for a synchronous
+ * window is V8's new-space used-bytes delta: no GC between the samples means
+ * every transient byte is still sitting in new space when the window closes.
+ */
+
+/** Current new-space used bytes, straight from V8. Fails closed if absent. */
+export function newSpaceUsed() {
+    const spaces = v8.getHeapSpaceStatistics();
+    for (let i = 0; i < spaces.length; i++) {
+        if (spaces[i].space_name === "new_space") return spaces[i].space_used_size;
+    }
+    die("newSpaceUsed: no new_space in getHeapSpaceStatistics()");
+}
+
+/**
+ * Total transient garbage fn(i) allocates over `ops` iterations, measured as the
+ * new-space used-bytes delta around a GC-free synchronous loop. gc() first for a
+ * clean slate; no GC between the two samples; a shrink means a scavenge ran
+ * mid-window (the workload overflowed new space) and the measurement is void.
+ * @param {(i:number)=>void} fn
+ * @param {number} ops
+ * @param {number} warmup
+ */
+export function allocTotal(fn, ops, warmup) {
+    for (let i = 0; i < warmup; i++) fn(i);
+    globalThis.gc();
+    const s0 = newSpaceUsed();
+    for (let i = 0; i < ops; i++) fn(i);
+    const s1 = newSpaceUsed();
+    const total = s1 - s0;
+    if (total < 0) die("allocTotal: new_space shrank mid-window (" + total + " B) -- a scavenge ran; the workload overflowed new space, shrink ops");
+    return total;
+}
 
 /* -- The signal registry the whole suite runs under ------------------------- */
 export function installRegistry(maxNodes = 1 << 18, maxLinks = 1 << 20) {
@@ -305,6 +347,7 @@ export const metrics = {
     gcMaxMs: 0,
     allocBytesPerOp: null,
     allocRetainedBytesPerCall: null,
+    transientBytesPerOp: null,
     poolGrowths: 0,
     pruneReclaimed: 0,
 };

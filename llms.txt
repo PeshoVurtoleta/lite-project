@@ -147,7 +147,11 @@ prune() -> number [1.1] [release slots that are BOTH un-overlaid AND unobserved;
 
 Steady state: re-overlaying a warmed key reuses pooled nodes (200k toggles ->
 poolGrowths/totalAllocations flat). First touch of a NEW key allocates its slot,
-a Map entry, and two pooled nodes. Warm the keys you churn.
+a Map entry, and two pooled nodes. Warm the keys you churn. Gated transient-clean
+since 1.4.1: warm get/peek/set/toggle windows measured by V8 new-space delta
+(<= 16384 B total per 50k-op window; measured ~0.13 B/op triangle noise). 1.4.0
+allocated ~40 B/op on get/peek/set via a hot-path closure context -- fixed and
+now impossible to reintroduce silently.
 
 ## Gotchas
 

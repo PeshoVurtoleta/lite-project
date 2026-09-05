@@ -201,23 +201,29 @@ export function createProjector(reg) {
         // Invariant: exp !== 0 implies overlaid, so prune() never orphans a deadline.
         const slots = new Map();
 
+        // Slot creation lives in its OWN function, never inline in slotFor: the
+        // creation closure captures `key`, and a capture inside slotFor's scope
+        // would make V8 allocate a context object on EVERY slotFor call -- hit or
+        // miss -- taxing get/peek/set ~40 B/op. Here the context is allocated only
+        // on the cold miss. (Bytes in a hot body: a closure in a cold branch still
+        // costs the hot branch its context.)
+        const _createSlot = (key) => {
+            // Detach owner+observer for creation: these nodes outlive the consumer
+            // that first reads `key`, and the projection -- not that consumer --
+            // owns their disposal. (See header: OWNERSHIP.)
+            return createRoot(() => {
+                const ov = signal(ABSENT);
+                const read = computed(() => {
+                    const o = ov();              // track the overlay
+                    const base = source.get(key); // track the source cell too
+                    return o === ABSENT ? base : o;
+                });
+                return { ov, read, exp: 0 };
+            });
+        };
         const slotFor = (key) => {
             let s = slots.get(key);
-            if (s === undefined) {
-                // Detach owner+observer for creation: these nodes outlive the consumer
-                // that first reads `key`, and the projection -- not that consumer --
-                // owns their disposal. (See header: OWNERSHIP.)
-                s = createRoot(() => {
-                    const ov = signal(ABSENT);
-                    const read = computed(() => {
-                        const o = ov();              // track the overlay
-                        const base = source.get(key); // track the source cell too
-                        return o === ABSENT ? base : o;
-                    });
-                    return { ov, read, exp: 0 };
-                });
-                slots.set(key, s);
-            }
+            if (s === undefined) { s = _createSlot(key); slots.set(key, s); }
             return s;
         };
 
@@ -371,11 +377,17 @@ export function createProjector(reg) {
             isDirty: () => dirtySig() > 0,
             // Untracked effective read (overlay if set, else source) -- for
             // reconciliation policies and imperative inspection, without subscribing.
+            // Source fallthrough rides the hoisted _pk/_readSrc scratch (the
+            // forEachPatch precedent): an inline untrack closure would capture
+            // `key` and cost EVERY peek a context allocation -- including the warm
+            // overlaid path that never takes the fallthrough.
             peek: (key) => {
                 const s = slots.get(key);
-                if (s === undefined) return untrack(() => source.get(key));
+                if (s === undefined) { _pk = key; return untrack(_readSrc); }
                 const o = s.ov.peek();
-                return o === ABSENT ? untrack(() => source.get(key)) : o;
+                if (o !== ABSENT) return o;
+                _pk = key;
+                return untrack(_readSrc);
             },
             // Iterate currently-overlaid keys (untracked). Cold path.
             forEachOverlay: (fn) => {
@@ -407,7 +419,10 @@ export function createProjector(reg) {
                     for (const [key, s] of slots) {
                         const o = s.ov.peek();
                         if (o !== ABSENT) {
-                            const authoritative = untrack(() => source.get(key));
+                            // _pk/_readSrc scratch (the forEachPatch precedent): an
+                            // inline untrack closure would allocate per overlaid key.
+                            _pk = key;
+                            const authoritative = untrack(_readSrc);
                             if (pol(authoritative, o, key)) { s.ov.set(ABSENT); _dropExp(s); dropped++; }
                         }
                     }

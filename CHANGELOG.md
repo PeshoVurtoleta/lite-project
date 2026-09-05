@@ -3,6 +3,35 @@
 All notable changes to `@zakkster/lite-project` are documented here. The format
 follows Keep a Changelog; this project adheres to semantic versioning.
 
+## Unreleased
+
+### Fixed
+
+- **Hot-path transient allocation (~40 B/op on `get`/`peek`/`set`).** The slot-
+  creation closure lived inline in `slotFor`'s cold miss branch and captured
+  `key`, so V8 allocated a context object on EVERY `slotFor` call -- hit or
+  miss -- taxing the three hottest operations ~40 B/op each (measured: warm
+  `get` 2,002,808 B over 50,000 ops). `peek` had the same defect twice over via
+  inline `untrack(() => source.get(key))` closures, allocating even on the warm
+  overlaid path that never takes the fallthrough; `reconcileAll` once per
+  overlaid key. Fixes: slot creation hoisted to `_createSlot(key)` (context now
+  allocated only on the cold miss), `peek` and `reconcileAll` ride the hoisted
+  `_pk`/`_readSrc` scratch that `forEachPatch` already used. Measured after:
+  0.04-0.15 B/op fixed noise across all warm windows. No API or behaviour
+  change.
+
+### Added
+
+- **T6 Proof 0, the transient witness.** Warm `get` / `peek` / `set` /
+  `set-clear toggle` / `get+set+clear` triangle windows are now hard-gated by
+  the V8 new-space used-bytes delta over a GC-free 50,000-op window
+  (<= 16,384 B total each). Every prior lane -- the gc-profiler heap gate, the
+  retained-bytes bracket, the pool census -- is structurally blind to per-op
+  garbage that never survives a collection, which is how the 40 B/op defect
+  above passed the full gate. The GATE line now reports `transient=<n> B/op`
+  (triangle; measured 0.131 B/op). Falsified: reverting the fix makes the gate
+  exit 1 naming the window.
+
 ## [1.4.0] - 2026-09-05
 
 ### Added
