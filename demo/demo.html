@@ -8,7 +8,9 @@
     <script type="importmap">
 {
   "imports": {
-    "@zakkster/lite-signal":  "https://esm.sh/@zakkster/lite-signal@1.5.0-alpha.0",
+    "@zakkster/lite-signal":  "../node_modules/@zakkster/lite-signal/Signal.js",
+    "@zakkster/lite-store":   "../node_modules/@zakkster/lite-store/Store.js",
+    "@zakkster/lite-crdt":    "../node_modules/@zakkster/lite-crdt/CRDT.js",
     "@zakkster/lite-project": "../Project.js"
   }
 }
@@ -48,7 +50,7 @@
 
         body {
             margin: 0;
-            min-height: 100 dvh;
+            min-height: 100dvh;
             background-color: var(--bg);
             background-image: repeating-linear-gradient(0deg, transparent 0, transparent 1.875rem, var(--grid) 1.875rem, var(--grid) calc(1.875rem + 1px)),
             repeating-linear-gradient(90deg, transparent 0, transparent 1.875rem, var(--grid) 1.875rem, var(--grid) calc(1.875rem + 1px));
@@ -405,6 +407,43 @@
             color: var(--conflict);
         }
 
+        .log .line.patch {
+            color: var(--ink);
+        }
+
+        /* TTL drain bar: armed once per stage, driven by a CSS animation --
+           zero JS per frame. --ttl is set as an inline custom property. */
+        .drain {
+            grid-column: 1 / -1;
+            height: 4px;
+            margin-top: 0.15rem;
+            background: var(--hairline);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .drain::after {
+            content: "";
+            display: block;
+            height: 100%;
+            background: linear-gradient(90deg, var(--amber), var(--phosphor));
+            transform: scaleX(0);
+            transform-origin: left;
+        }
+
+        .drain.armed::after {
+            animation: drain var(--ttl, 4000ms) linear forwards;
+        }
+
+        @keyframes drain {
+            from {
+                transform: scaleX(1);
+            }
+            to {
+                transform: scaleX(0);
+            }
+        }
+
         .note {
             font-size: 0.72rem;
             color: var(--ink-dim);
@@ -441,6 +480,10 @@
         <button data-scene="granular">2 &middot; Granular</button>
         <button data-scene="reconcile">3 &middot; Reconcile</button>
         <button data-scene="query">4 &middot; Query</button>
+        <button data-scene="patch">5 &middot; Patch</button>
+        <button data-scene="ttl">6 &middot; TTL</button>
+        <button data-scene="where">7 &middot; Where</button>
+        <button data-scene="crdt">8 &middot; CRDT</button>
     </nav>
 
     <!-- ------------------------- SCENE 1: OVERLAY ------------------------- -->
@@ -569,17 +612,170 @@
         </div>
     </section>
 
+    <!-- ------------------------- SCENE 5: PATCH (1.2) ------------------------- -->
+    <section class="scene" data-scene="patch">
+        <p class="scene-intro"><b>Patch emission</b> [1.2]. <code>forEachPatch(fn)</code> streams the staged drafts as
+            <code>fn(key, from, to)</code> &mdash; <code>from</code> is the current source value, <code>to</code> the
+            draft. Read-only, untracked, zero-alloc per key. By default an <b>unchanged</b> draft is emitted too (the
+            stream always matches <code>dirtyCount()</code>); pass a skip predicate (<code>confirmOnEcho</code>) to
+            drop echoes. <code>toPatch()</code> is the allocating cold convenience.</p>
+        <div class="grid two">
+            <div class="panel">
+                <h2>Staged drafts</h2>
+                <div class="colhead"><span>key</span><span>authoritative</span><span>overlay (draft)</span><span>effective</span>
+                </div>
+                <div class="rows" id="pt-rows"></div>
+                <div class="controls">
+                    <button class="act" id="pt-stage">stage 2 drafts</button>
+                    <button class="act ghost" id="pt-echo">stage unchanged draft</button>
+                    <button class="act warn" id="pt-revert">revert</button>
+                </div>
+                <p class="note">"stage unchanged" sets <code>region</code> to its <em>current source value</em> &mdash;
+                    a draft where <code>Object.is(from, to)</code>. Emitted by default; skipped under
+                    <code>confirmOnEcho</code>.</p>
+            </div>
+            <div class="panel">
+                <h2>Emit</h2>
+                <div class="stat">
+                    <div class="item"><span class="lab">dirty</span><span class="val" id="pt-dirty">0</span></div>
+                    <div class="item"><span class="lab">last emit</span><span class="val" id="pt-emitted">&mdash;</span></div>
+                    <div class="item"><span class="lab">skip echoes</span><span class="val"><input type="checkbox" id="pt-skip"></span></div>
+                </div>
+                <div class="controls">
+                    <button class="act" id="pt-emit">forEachPatch(fn)</button>
+                    <button class="act ghost" id="pt-json">toPatch() &rarr; JSON</button>
+                </div>
+                <h2>Patch stream</h2>
+                <div class="log" id="pt-log"></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ------------------------- SCENE 6: TTL (1.3) ------------------------- -->
+    <section class="scene" data-scene="ttl">
+        <p class="scene-intro"><b>Overlay TTL</b> [1.3]. <code>set(key, v, {ttl})</code> stages a draft that
+            <b>auto-reverts</b> when the deadline passes &mdash; the source is <b>never</b> touched. One re-armed timer
+            per projection; re-set re-arms; commit / clear / revert cancel. The self-heal for a lost ack &mdash; and for
+            <b>object drafts</b>, which can never echo-confirm under <code>Object.is</code>.</p>
+        <div class="grid two">
+            <div class="panel">
+                <h2>Draft with a deadline</h2>
+                <div class="colhead"><span>key</span><span>authoritative</span><span>overlay (draft)</span><span>effective</span>
+                </div>
+                <div class="rows" id="ttl-rows"></div>
+                <div class="controls">
+                    <button class="act" id="ttl-stage">stage "pro" {ttl: 4s}</button>
+                    <button class="act ghost" id="ttl-rearm">re-stage (re-arm)</button>
+                    <button class="act" id="ttl-commit">commit (cancels ttl)</button>
+                    <button class="act warn" id="ttl-revert">revert (cancels ttl)</button>
+                </div>
+                <p class="note">The bar is the deadline. Let it empty &rarr; the draft vanishes on its own and
+                    AUTHORITATIVE shows through; the log marks the auto-revert. The demo runs the real platform clock
+                    &mdash; tests inject <code>{now, setTimer, clearTimer}</code> for determinism.</p>
+            </div>
+            <div class="panel">
+                <h2>State</h2>
+                <div class="stat">
+                    <div class="item"><span class="lab">status</span><span class="val" id="ttl-status">clean</span></div>
+                </div>
+                <h2>Log</h2>
+                <div class="log" id="ttl-log"></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ------------------------- SCENE 7: WHERE (1.3) ------------------------- -->
+    <section class="scene" data-scene="where">
+        <p class="scene-intro"><b>Partial saves</b> [1.3]. <code>commitWhere(pred)</code> /
+            <code>clearWhere(pred)</code> commit or discard <b>exactly</b> the overlaid keys the predicate picks
+            (<code>pred(key, stagedValue)</code>), in <b>one</b> reactive propagation. The rest of the drafts survive.</p>
+        <div class="grid two">
+            <div class="panel">
+                <h2>Mixed drafts</h2>
+                <div class="colhead"><span>key</span><span>authoritative</span><span>overlay (draft)</span><span>effective</span>
+                </div>
+                <div class="rows" id="wh-rows"></div>
+                <div class="controls">
+                    <button class="act" id="wh-stage">stage all 4</button>
+                    <button class="act" id="wh-commit">commitWhere(profile.*)</button>
+                    <button class="act warn" id="wh-clear">clearWhere(sys.*)</button>
+                    <button class="act ghost" id="wh-revert">revert</button>
+                </div>
+                <p class="note"><code>commitWhere(k =&gt; k.startsWith("profile."))</code> writes the two profile
+                    drafts through and leaves the <code>sys.*</code> drafts staged;
+                    <code>clearWhere</code> drops its matches with <b>zero</b> source writes.</p>
+            </div>
+            <div class="panel">
+                <h2>Telemetry</h2>
+                <div class="stat">
+                    <div class="item"><span class="lab">dirty</span><span class="val" id="wh-dirty">0</span></div>
+                    <div class="item"><span class="lab">source writes</span><span class="val" id="wh-writes">0</span></div>
+                    <div class="item"><span class="lab">dirty propagations</span><span class="val" id="wh-props">0</span></div>
+                </div>
+                <h2>Log</h2>
+                <div class="log" id="wh-log"></div>
+                <p class="note">"dirty propagations" counts re-runs of one effect on <code>dirtyCount()</code>: a
+                    <code>commitWhere</code> hitting two keys bumps it <b>once</b> &mdash; one batch, one propagation.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- ------------------------- SCENE 8: CRDT (1.4) ------------------------- -->
+    <section class="scene" data-scene="crdt">
+        <p class="scene-intro"><b>projectCRDT</b> [1.4]. Two <b>real</b> <code>lite-crdt</code> replicas, synced
+            op-by-op in memory. The projection drafts over replica A's LWW-Map through its <b>fine-grained</b> reactive
+            <code>get(key)</code> &mdash; staging touches no CRDT, <b>commit</b> emits ops that converge B, and a write
+            on B auto-reconciles A's drafts: an <b>echo</b> drops the draft, a <b>conflict</b> stays masked. (Object
+            drafts never echo-confirm &mdash; lite-crdt hands back a read-only wrapper, so <code>Object.is</code> can't
+            match; use <code>{ttl}</code> or a structural policy.)</p>
+        <div class="grid two">
+            <div class="panel">
+                <h2>Replica A &mdash; projectCRDT(docA.map("profile"))</h2>
+                <div class="colhead"><span>key</span><span>map A</span><span>overlay (draft)</span><span>effective</span>
+                </div>
+                <div class="rows" id="cr-rows"></div>
+                <div class="controls">
+                    <button class="act" id="cr-stage">stage 3 drafts</button>
+                    <button class="act" id="cr-commit">commit &rarr; 3 ops / 3 frames</button>
+                    <button class="act" id="cr-tx">commit in doc.transact &rarr; 1 frame</button>
+                    <button class="act warn" id="cr-revert">revert</button>
+                </div>
+                <p class="note">Staging emits <b>0</b> ops &mdash; the CRDT is untouched until commit. LWW ops are
+                    commutative + idempotent, so 3 frames and 1 frame converge identically;
+                    <code>transact</code> just coalesces the wire.</p>
+            </div>
+            <div class="panel">
+                <h2>Replica B &mdash; authoritative peer</h2>
+                <div class="colhead"><span>key</span><span class="wide">map B (converged)</span></div>
+                <div class="rows" id="cr-brows"></div>
+                <div class="controls">
+                    <button class="act" id="cr-echo">B echoes the plan draft</button>
+                    <button class="act danger" id="cr-conflict">B sets plan &rarr; "enterprise"</button>
+                </div>
+                <div class="stat">
+                    <div class="item"><span class="lab">frames A&rarr;B</span><span class="val" id="cr-ab">0</span></div>
+                    <div class="item"><span class="lab">frames B&rarr;A</span><span class="val" id="cr-ba">0</span></div>
+                    <div class="item"><span class="lab">dirty</span><span class="val" id="cr-dirty">0</span></div>
+                    <div class="item"><span class="lab">status</span><span class="val" id="cr-status">clean</span></div>
+                </div>
+                <h2>Log</h2>
+                <div class="log" id="cr-log"></div>
+            </div>
+        </div>
+    </section>
+
     <footer>
-        Live on the real engine: <code>@zakkster/lite-project</code> + <code>@zakkster/lite-signal</code>. The "server"
-        here is just <code>source.set(...)</code> + <code>reconcileAll()</code>; in production that's an echo from
-        <code>projectRoom</code> (CRDT) or <code>makeReconciler</code> wired to a socket. Run from the package root:
+        Live on the real engine: <code>@zakkster/lite-project</code> + <code>@zakkster/lite-signal</code> &mdash; and in
+        scene 8, two real <code>@zakkster/lite-crdt</code> replicas synced op-by-op. Everything resolves locally from
+        <code>node_modules</code>. Run from the package root:
         <code>npx serve .</code> &rarr; open <code>/demo/</code>.
     </footer>
 </div>
 
 <script type="module">
     import {effect} from "@zakkster/lite-signal";
-    import {project, keyedStore, confirmOnEcho, projectQuery} from "@zakkster/lite-project";
+    import {project, keyedStore, confirmOnEcho, projectQuery, projectCRDT} from "@zakkster/lite-project";
+    import {createCRDTDoc} from "@zakkster/lite-crdt";
 
     // ---------------------------------------------------------------------------
     // DOM cache -- resolved once at init ($-prefixed). No lookups inside handlers.
@@ -961,6 +1157,367 @@
         qRender();
     });
     document.getElementById("q-revert").addEventListener("click", () => { qProj.revert(); logLine($qLog, "revert &mdash; all drafts dropped", "revert"); qRender(); });
+
+    // ===========================================================================
+    // SCENE 5 -- Patch emission [1.2]: forEachPatch / toPatch over staged drafts
+    // ===========================================================================
+    const $ptRows = document.getElementById("pt-rows");
+    const $ptLog = document.getElementById("pt-log");
+    const $ptDirty = document.getElementById("pt-dirty");
+    const $ptEmitted = document.getElementById("pt-emitted");
+    const $ptSkip = document.getElementById("pt-skip");
+
+    const ptSource = keyedStore(SEED);
+    const ptProj = project(ptSource);
+
+    const ptCells = {};
+    for (const key of KEYS) {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.innerHTML =
+            '<span class="k">' + key + '</span>' +
+            '<span class="cell auth"></span>' +
+            '<span class="cell ov" data-empty="1">&mdash;</span>' +
+            '<span class="cell eff"></span>';
+        $ptRows.appendChild(row);
+        ptCells[key] = {
+            auth: row.querySelector(".cell.auth"),
+            ov: row.querySelector(".cell.ov"),
+            eff: row.querySelector(".cell.eff"),
+        };
+        effect(() => { ptCells[key].eff.textContent = String(ptProj.get(key)); });
+        effect(() => { ptCells[key].auth.textContent = String(ptSource.get(key)); });
+    }
+    effect(() => { $ptDirty.textContent = String(ptProj.dirtyCount()); });
+
+    function ptRender() {
+        for (const key of KEYS) {
+            const overlaid = ptProj.isOverlaid(key);
+            ptCells[key].ov.textContent = overlaid ? String(ptProj.peek(key)) : "\u2014";
+            ptCells[key].ov.setAttribute("data-empty", overlaid ? "0" : "1");
+        }
+    }
+
+    document.getElementById("pt-stage").addEventListener("click", () => {
+        ptProj.set("displayName", "ava-next");
+        ptProj.set("plan", "pro");
+        logLine($ptLog, 'stage displayName &rarr; "ava-next", plan &rarr; "pro"');
+        ptRender();
+    });
+    document.getElementById("pt-echo").addEventListener("click", () => {
+        const cur = ptSource.get("region");
+        ptProj.set("region", cur);            // a draft where Object.is(from, to)
+        logLine($ptLog, 'stage region &rarr; "' + cur + '" (UNCHANGED: from === to)');
+        ptRender();
+    });
+    document.getElementById("pt-emit").addEventListener("click", () => {
+        const skip = $ptSkip.checked ? confirmOnEcho : undefined;
+        let n = 0;
+        ptProj.forEachPatch((key, from, to) => {
+            n++;
+            logLine($ptLog, "  fn(" + String(key) + ", " + show(from) + " &rarr; " + show(to) + ")", "patch");
+        }, skip);
+        $ptEmitted.textContent = String(n);
+        logLine($ptLog, "forEachPatch" + (skip ? " + skip=confirmOnEcho" : "") + " emitted " + n +
+            " of " + ptProj.dirtyCount() + " dirty", "commit");
+    });
+    document.getElementById("pt-json").addEventListener("click", () => {
+        const skip = $ptSkip.checked ? confirmOnEcho : undefined;
+        const patches = ptProj.toPatch(skip);
+        $ptEmitted.textContent = String(patches.length);
+        logLine($ptLog, "toPatch() &rarr; " + JSON.stringify(patches), "patch");
+    });
+    document.getElementById("pt-revert").addEventListener("click", () => {
+        ptProj.revert();
+        logLine($ptLog, "revert &mdash; all drafts dropped", "revert");
+        ptRender();
+    });
+
+    // ===========================================================================
+    // SCENE 6 -- Overlay TTL [1.3]: set(key, v, {ttl}) auto-reverts on the deadline
+    // ===========================================================================
+    const $ttlRows = document.getElementById("ttl-rows");
+    const $ttlLog = document.getElementById("ttl-log");
+    const $ttlStatus = document.getElementById("ttl-status");
+
+    const TTL_KEY = "plan";
+    const TTL_MS = 4000;
+    const ttlSource = keyedStore({plan: "free"});
+    const ttlProj = project(ttlSource);       // real platform clock (tests inject one)
+
+    const ttlRow = document.createElement("div");
+    ttlRow.className = "row";
+    ttlRow.innerHTML =
+        '<span class="k">plan</span>' +
+        '<span class="cell auth"></span>' +
+        '<span class="cell ov" data-empty="1">&mdash;</span>' +
+        '<span class="cell eff"></span>' +
+        '<span class="drain"></span>';
+    $ttlRows.appendChild(ttlRow);
+    const ttlAuth = ttlRow.querySelector(".cell.auth");
+    const ttlOv = ttlRow.querySelector(".cell.ov");
+    const ttlEff = ttlRow.querySelector(".cell.eff");
+    const ttlBar = ttlRow.querySelector(".drain");
+
+    effect(() => { ttlEff.textContent = String(ttlProj.get(TTL_KEY)); });
+    effect(() => { ttlAuth.textContent = String(ttlSource.get(TTL_KEY)); });
+
+    function ttlArmBar() {
+        ttlBar.style.setProperty("--ttl", TTL_MS + "ms");
+        ttlBar.classList.remove("armed");
+        void ttlBar.offsetWidth;              // restart the CSS animation (one-shot, on click)
+        ttlBar.classList.add("armed");
+    }
+
+    function ttlRender() {
+        const overlaid = ttlProj.isOverlaid(TTL_KEY);
+        ttlOv.textContent = overlaid ? String(ttlProj.peek(TTL_KEY)) : "\u2014";
+        ttlOv.setAttribute("data-empty", overlaid ? "0" : "1");
+        $ttlStatus.textContent = overlaid ? "pending" : "clean";
+        $ttlStatus.dataset.state = overlaid ? "pending" : "clean";
+        if (!overlaid) ttlBar.classList.remove("armed");
+    }
+
+    // the fire arrives with no user action: watch the reactive dirty count.
+    // ttlManual guards button-driven transitions so only the timer logs here.
+    let ttlManual = false;
+    let ttlWasDirty = false;
+    effect(() => {
+        const dirty = ttlProj.dirtyCount() > 0;
+        if (ttlWasDirty && !dirty && !ttlManual) {
+            logLine($ttlLog, "TTL fired &rarr; auto-REVERT (draft dropped, source untouched)", "revert");
+        }
+        ttlWasDirty = dirty;
+        ttlRender();
+    });
+
+    document.getElementById("ttl-stage").addEventListener("click", () => {
+        ttlManual = true;
+        ttlProj.set(TTL_KEY, "pro", {ttl: TTL_MS});
+        ttlManual = false;
+        ttlArmBar();
+        logLine($ttlLog, 'set(plan, "pro", {ttl: ' + TTL_MS + '}) &mdash; deadline armed');
+        ttlRender();
+    });
+    document.getElementById("ttl-rearm").addEventListener("click", () => {
+        ttlManual = true;
+        ttlProj.set(TTL_KEY, "pro", {ttl: TTL_MS});
+        ttlManual = false;
+        ttlArmBar();
+        logLine($ttlLog, "re-set with {ttl} &rarr; deadline RE-ARMED");
+        ttlRender();
+    });
+    document.getElementById("ttl-commit").addEventListener("click", () => {
+        if (!ttlProj.isOverlaid(TTL_KEY)) { logLine($ttlLog, "commit (nothing staged)"); return; }
+        ttlManual = true;
+        ttlProj.commit(TTL_KEY);
+        ttlManual = false;
+        logLine($ttlLog, "commit &rarr; source written, expiry CANCELLED", "commit");
+        ttlRender();
+    });
+    document.getElementById("ttl-revert").addEventListener("click", () => {
+        ttlManual = true;
+        ttlProj.revert();
+        ttlManual = false;
+        logLine($ttlLog, "revert &rarr; draft dropped, expiry CANCELLED", "revert");
+        ttlRender();
+    });
+
+    // ===========================================================================
+    // SCENE 7 -- Partial saves [1.3]: commitWhere / clearWhere
+    // ===========================================================================
+    const $whRows = document.getElementById("wh-rows");
+    const $whLog = document.getElementById("wh-log");
+    const $whDirty = document.getElementById("wh-dirty");
+    const $whWrites = document.getElementById("wh-writes");
+    const $whProps = document.getElementById("wh-props");
+
+    const WH_KEYS = ["profile.name", "profile.email", "sys.cache", "sys.flag"];
+    const WH_DRAFTS = {"profile.name": "ava-2", "profile.email": "ava@y.dev", "sys.cache": "cold", "sys.flag": "on"};
+    const whBase = keyedStore({"profile.name": "ava", "profile.email": "ava@x.dev", "sys.cache": "warm", "sys.flag": "off"});
+    let whWrites = 0;
+    const whSource = {
+        get: (k) => whBase.get(k),
+        set: (k, v) => { whWrites++; $whWrites.textContent = String(whWrites); whBase.set(k, v); },
+    };
+    const whProj = project(whSource);
+    const whIsProfile = (key) => String(key).startsWith("profile.");
+    const whIsSys = (key) => String(key).startsWith("sys.");
+
+    const whCells = {};
+    for (const key of WH_KEYS) {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.innerHTML =
+            '<span class="k">' + key + '</span>' +
+            '<span class="cell auth"></span>' +
+            '<span class="cell ov" data-empty="1">&mdash;</span>' +
+            '<span class="cell eff"></span>';
+        $whRows.appendChild(row);
+        whCells[key] = {
+            auth: row.querySelector(".cell.auth"),
+            ov: row.querySelector(".cell.ov"),
+            eff: row.querySelector(".cell.eff"),
+        };
+        effect(() => { whCells[key].eff.textContent = String(whProj.get(key)); });
+        effect(() => { whCells[key].auth.textContent = String(whBase.get(key)); });
+    }
+    effect(() => { $whDirty.textContent = String(whProj.dirtyCount()); });
+
+    // one effect on dirtyCount(): commitWhere/clearWhere bump it ONCE per call
+    let whProps = -1;                          // -1 absorbs the initial run
+    effect(() => {
+        whProj.dirtyCount();
+        whProps = (whProps + 1) | 0;
+        $whProps.textContent = String(whProps < 0 ? 0 : whProps);
+    });
+
+    function whRender() {
+        for (const key of WH_KEYS) {
+            const overlaid = whProj.isOverlaid(key);
+            whCells[key].ov.textContent = overlaid ? String(whProj.peek(key)) : "\u2014";
+            whCells[key].ov.setAttribute("data-empty", overlaid ? "0" : "1");
+        }
+    }
+
+    document.getElementById("wh-stage").addEventListener("click", () => {
+        for (const key of WH_KEYS) whProj.set(key, WH_DRAFTS[key]);
+        logLine($whLog, "stage all 4 drafts (2x profile.*, 2x sys.*)");
+        whRender();
+    });
+    document.getElementById("wh-commit").addEventListener("click", () => {
+        const before = whProj.dirtyCount();
+        whProj.commitWhere(whIsProfile);
+        const hit = before - whProj.dirtyCount();
+        logLine($whLog, "commitWhere(profile.*) &rarr; " + hit + " committed, " +
+            whProj.dirtyCount() + " survive; ONE propagation", "commit");
+        whRender();
+    });
+    document.getElementById("wh-clear").addEventListener("click", () => {
+        const before = whProj.dirtyCount();
+        whProj.clearWhere(whIsSys);
+        const hit = before - whProj.dirtyCount();
+        logLine($whLog, "clearWhere(sys.*) &rarr; " + hit + " dropped, ZERO source writes", "revert");
+        whRender();
+    });
+    document.getElementById("wh-revert").addEventListener("click", () => {
+        whProj.revert();
+        logLine($whLog, "revert &mdash; all drafts dropped", "revert");
+        whRender();
+    });
+
+    // ===========================================================================
+    // SCENE 8 -- projectCRDT [1.4]: two real lite-crdt replicas, in-memory transport
+    // ===========================================================================
+    const $crRows = document.getElementById("cr-rows");
+    const $crBRows = document.getElementById("cr-brows");
+    const $crLog = document.getElementById("cr-log");
+    const $crAB = document.getElementById("cr-ab");
+    const $crBA = document.getElementById("cr-ba");
+    const $crDirty = document.getElementById("cr-dirty");
+    const $crStatus = document.getElementById("cr-status");
+
+    const CR_KEYS = ["plan", "region", "theme"];
+    // fresh values every round: re-staging an already-committed value would be an
+    // instant ECHO (auto-reconcile drops it on the spot -- correct, but nothing to see)
+    let crRound = 0;
+
+    const docA = createCRDTDoc({replicaId: "replica-A"});
+    const docB = createCRDTDoc({replicaId: "replica-B"});
+    let framesAB = 0, framesBA = 0;
+    docA.on("ops", (ops) => { framesAB++; $crAB.textContent = String(framesAB); docB.applyOps(ops); });
+    docB.on("ops", (ops) => { framesBA++; $crBA.textContent = String(framesBA); docA.applyOps(ops); });
+
+    const mapA = docA.map("profile");
+    const mapB = docB.map("profile");
+    // seed via B, converge A, then zero the wire counters for a clean start
+    mapB.set("plan", "free");
+    mapB.set("region", "eu-west");
+    mapB.set("theme", "dark");
+    framesAB = 0; framesBA = 0;
+    $crAB.textContent = "0"; $crBA.textContent = "0";
+
+    const crProj = projectCRDT(mapA);          // fine-grained reactive get(key); default policy
+
+    const crCells = {};
+    for (const key of CR_KEYS) {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.innerHTML =
+            '<span class="k">' + key + '</span>' +
+            '<span class="cell auth"></span>' +
+            '<span class="cell ov" data-empty="1">&mdash;</span>' +
+            '<span class="cell eff"></span>';
+        $crRows.appendChild(row);
+        crCells[key] = {
+            auth: row.querySelector(".cell.auth"),
+            ov: row.querySelector(".cell.ov"),
+            eff: row.querySelector(".cell.eff"),
+        };
+        effect(() => { crCells[key].eff.textContent = show(crProj.get(key)); });
+        effect(() => { crCells[key].auth.textContent = show(mapA.get(key)); });
+
+        const brow = document.createElement("div");
+        brow.className = "row";
+        brow.innerHTML = '<span class="k">' + key + '</span><span class="cell eff wide"></span>';
+        $crBRows.appendChild(brow);
+        const bcell = brow.querySelector(".cell.eff");
+        effect(() => { bcell.textContent = show(mapB.get(key)); });
+    }
+
+    // scene sync: tracks the dirty count AND replica A's cells, so a reconcile
+    // (echo drop) or a remote conflict re-renders the drafts + status unprompted.
+    function crRender() {
+        let dirty = 0, conflict = false;
+        for (const key of CR_KEYS) {
+            const overlaid = crProj.isOverlaid(key);
+            crCells[key].ov.textContent = overlaid ? String(crProj.peek(key)) : "\u2014";
+            crCells[key].ov.setAttribute("data-empty", overlaid ? "0" : "1");
+            const c = overlaid && !confirmOnEcho(mapA.get(key), crProj.peek(key));
+            crCells[key].eff.setAttribute("data-conflict", c ? "1" : "0");
+            if (overlaid) dirty++;
+            if (c) conflict = true;
+        }
+        $crDirty.textContent = String(dirty);
+        $crStatus.textContent = conflict ? "conflict" : dirty ? "pending" : "clean";
+        $crStatus.dataset.state = conflict ? "conflict" : dirty ? "pending" : "clean";
+    }
+    effect(() => {
+        crProj.dirtyCount();                   // overlay-set transitions
+        for (const key of CR_KEYS) mapA.get(key);   // authoritative changes
+        crRender();
+    });
+
+    document.getElementById("cr-stage").addEventListener("click", () => {
+        crRound = (crRound + 1) | 0;
+        crProj.set("plan", "pro-" + crRound);
+        crProj.set("region", "us-east-" + crRound);
+        crProj.set("theme", "phosphor-" + crRound);
+        logLine($crLog, "stage 3 drafts (round " + crRound + ") &mdash; 0 ops emitted, both maps untouched");
+    });
+    document.getElementById("cr-commit").addEventListener("click", () => {
+        const before = framesAB;
+        crProj.commit();
+        logLine($crLog, "commit &rarr; " + (framesAB - before) + " frames to B (one op per key)", "commit");
+    });
+    document.getElementById("cr-tx").addEventListener("click", () => {
+        const before = framesAB;
+        docA.transact(() => crProj.commit());
+        logLine($crLog, "doc.transact(commit) &rarr; " + (framesAB - before) + " frame to B (coalesced)", "commit");
+    });
+    document.getElementById("cr-revert").addEventListener("click", () => {
+        crProj.revert();
+        logLine($crLog, "revert &mdash; drafts dropped, CRDT untouched", "revert");
+    });
+    document.getElementById("cr-echo").addEventListener("click", () => {
+        if (!crProj.isOverlaid("plan")) { logLine($crLog, "stage first &mdash; no plan draft to echo"); return; }
+        mapB.set("plan", crProj.peek("plan"));
+        logLine($crLog, "B echoed the plan draft &rarr; op to A &rarr; auto-reconcile DROPPED it", "commit");
+    });
+    document.getElementById("cr-conflict").addEventListener("click", () => {
+        mapB.set("plan", "enterprise");
+        logLine($crLog, 'B set plan &rarr; "enterprise" &mdash; a staged draft stays MASKED (conflict)', "conflict");
+    });
 
     // ===========================================================================
     // Tab switching
