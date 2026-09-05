@@ -153,6 +153,51 @@ export function graphDelta(before, reg) {
     };
 }
 
+/* -- Deterministic, counting fake clock (overlay TTL) ----------------------- */
+/**
+ * A virtual-time clock for the overlay TTL: `now/setTimer/clearTimer` are the
+ * flat bag project(source, opts) reads, `advance(ms)` steps time and fires every
+ * due timer (re-scanning after each fire so a re-arm inside a fire is honoured),
+ * and `outstanding()/maxOutstanding()` count live handles so T7's one-handle
+ * invariant is directly observable. ONE implementation, shared by T4/T6/T7/T9, so
+ * a control can never drift from the gate it proves. Deterministic: no real timers.
+ */
+export function makeFakeClock() {
+    let t = 0;
+    let nextId = 1;
+    let outstanding = 0;
+    let maxOut = 0;
+    const timers = new Map();               // id -> { fireAt, fn }
+    return {
+        now: () => t,
+        setTimer: (fn, ms) => {
+            const id = nextId++;
+            timers.set(id, { fireAt: t + ms, fn });
+            outstanding++;
+            if (outstanding > maxOut) maxOut = outstanding;
+            return id;
+        },
+        clearTimer: (id) => { if (timers.delete(id)) outstanding--; },
+        advance(ms) {
+            t += ms;
+            let ran = true;
+            while (ran) {
+                ran = false;
+                for (const [id, tm] of timers) {
+                    if (tm.fireAt <= t) {
+                        timers.delete(id); outstanding--;
+                        tm.fn();
+                        ran = true;
+                        break;              // re-scan: a re-arm may have added a handle
+                    }
+                }
+            }
+        },
+        outstanding: () => outstanding,
+        maxOutstanding: () => maxOut,
+    };
+}
+
 /* -- Plain-Map overlay oracle ----------------------------------------------- */
 /**
  * A dependency-free model of a projection: `src` is the authoritative backing,
@@ -167,6 +212,38 @@ export function makeOracle() {
         ov,
         effective: (k) => (ov.has(k) ? ov.get(k) : src.get(k)),
         dirty: () => ov.size,
+    };
+}
+
+/* -- Registry-parametric structural fake LWW-Map (projectCRDT) --------------- */
+/**
+ * A dependency-free stand-in for a lite-crdt LWW-Map, built on ONE signal per key
+ * from the tier's registry (`reg = { signal }`). It mimics the PROBED lite-crdt
+ * semantics that matter to projectCRDT: `get(k)` is a FINE-GRAINED tracked read
+ * that is LIVE for a missing key (an effect re-runs when the key later appears);
+ * `set`/`delete` mutate the same per-key cell (`delete` writes undefined, matching
+ * "an authoritative delete reads as undefined"); EVERY key is String()-coerced so
+ * the numeric/symbol ALIAS hazard is reproduced; `opCount()` counts mutations. It
+ * does NOT simulate the read-only object WRAPPER -- that is a lite-crdt read-path
+ * detail with no registry-portable behaviour, pinned against the REAL package in
+ * test/crdt_test.mjs (simulating it would make the fake the thing under test).
+ * @param {{signal:Function}} reg the tier's registry (uses reg.signal only).
+ */
+export function makeFakeMap(reg) {
+    const signal = reg.signal;
+    const cells = new Map();
+    let ops = 0;
+    const cell = (k) => {
+        const s = String(k);                   // string coercion on EVERY key
+        let c = cells.get(s);
+        if (c === undefined) { c = signal(undefined); cells.set(s, c); }
+        return c;
+    };
+    return {
+        get: (k) => cell(k)(),                 // fine-grained tracked read, live for a missing key
+        set: (k, v) => { cell(k).set(v); ops++; },
+        delete: (k) => { cell(k).set(undefined); },
+        opCount: () => ops,
     };
 }
 

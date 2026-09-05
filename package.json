@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-project",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "description": "Zero-GC projections for @zakkster/lite-signal: granular, derived, non-mutating reactive overlays with commit / revert / reconcile, and draft adapters for lite-store and lite-room.",
   "type": "module",
   "main": "./Project.js",
@@ -33,9 +33,11 @@
     "@zakkster/lite-signal": "^1.5.0"
   },
   "devDependencies": {
+    "@zakkster/lite-crdt": "^2.0.0",
     "@zakkster/lite-gc-profiler": "^1.16.0",
     "@zakkster/lite-leak": "^1.10.0",
-    "@zakkster/lite-signal": "^1.5.0"
+    "@zakkster/lite-signal": "^1.5.0",
+    "@zakkster/lite-store": "^1.2.1"
   },
   "keywords": [
     "reactive",

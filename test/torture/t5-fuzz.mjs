@@ -7,9 +7,9 @@
  * pre-grown "throw" registry. Every projectQuery.commit is exactly one
  * setQueryData write. validate() after every op.
  */
-import { project, projectQuery, keyedStore } from "../../Project.js";
+import { project, projectQuery, projectCRDT, keyedStore } from "../../Project.js";
 import { signal } from "@zakkster/lite-signal";
-import { SEED, makePrng, frac, check, makeOracle, validate } from "./harness.mjs";
+import { SEED, makePrng, frac, check, makeOracle, validate, makeFakeMap } from "./harness.mjs";
 
 const KEYS = ["a", "b", "c", "d", "e"];
 const SEQS = 40;
@@ -147,7 +147,80 @@ function queryFuzz() {
     }
 }
 
+// projectCRDT fuzz over a fine-grained fake LWW-Map. The auto-reconcile effect
+// fires on overlay-set transitions and on authoritative changes to overlaid keys,
+// so the oracle mirrors an Object.is echo-drop at exactly those points:
+//   - staging a NEW overlay (absent -> value) re-runs the effect: drop it if it
+//     equals the current source (a scalar echo staged onto its own value);
+//   - an authoritative write to an OVERLAID key re-runs the effect: drop the
+//     overlay if the new value echoes it.
+// A value-only re-set (still present) does NOT fire the effect, so it never drops.
+function crdtFuzz() {
+    for (let seq = 0; seq < SEQS; seq++) {
+        const prng = makePrng((SEED ^ 0xC011) + seq);
+        const map = makeFakeMap({ signal });
+        const oracle = makeOracle();
+        for (const k of KEYS) { const val = (frac(prng) * 10) | 0; map.set(k, val); oracle.src.set(k, val); }
+        const v = projectCRDT(map);
+
+        for (let i = 0; i < OPS; i++) {
+            const op = (frac(prng) * 6) | 0;
+            const k = KEYS[(frac(prng) * KEYS.length) | 0];
+            if (op === 0) {
+                const wasOverlaid = oracle.ov.has(k);
+                const val = pick(prng);
+                v.set(k, val); oracle.ov.set(k, val);
+                // Only a presence transition fires the effect (echo-drop chance).
+                if (!wasOverlaid && Object.is(oracle.src.get(k), val)) oracle.ov.delete(k);
+            } else if (op === 1) { v.clear(k); oracle.ov.delete(k); }
+            else if (op === 2) {
+                v.commit(k);
+                if (oracle.ov.has(k)) { oracle.src.set(k, oracle.ov.get(k)); oracle.ov.delete(k); }
+            } else if (op === 3) {
+                v.commit();
+                for (const [dk, dv] of oracle.ov) oracle.src.set(dk, dv);
+                oracle.ov.clear();
+            } else if (op === 4) { v.revert(); oracle.ov.clear(); }
+            else {
+                const val = pick(prng);
+                map.set(k, val); oracle.src.set(k, val);   // authoritative write
+                // Fires the effect only if k is overlaid (its cell is tracked).
+                if (oracle.ov.has(k) && Object.is(val, oracle.ov.get(k))) oracle.ov.delete(k);
+            }
+            validate(v, null, oracle);
+        }
+        v.dispose();
+    }
+}
+
+// The granularity law: the reconcile effect tracks ONLY the source cells of
+// currently-overlaid keys, so an authoritative write to a NON-overlaid key never
+// re-runs it. Measured via a policy counter (one call per overlaid key per pass);
+// with a single persistent overlay, policy-call deltas == reconcile-pass count.
+// This is the law control (j) inverts (a coarse effect reading every cell).
+function crdtGranularity() {
+    const map = makeFakeMap({ signal });
+    for (let i = 0; i < 10; i++) map.set("n" + i, 0);
+    map.set("a", 0);
+    let policyCalls = 0;
+    const v = projectCRDT(map, { policy: (auth, ov) => { policyCalls++; return Object.is(auth, ov); } });
+    v.set("a", 9);                       // a overlaid (transition) -> effect fires, conflict kept
+    map.set("a", 7);                     // authoritative change to the OVERLAID key -> fires, kept
+    const base = policyCalls;
+    for (let i = 0; i < 10; i++) map.set("n" + i, i + 1);   // writes to NON-overlaid keys
+    check(policyCalls - base === 0,
+        () => "T5 crdt granularity: reconcile fired on a non-overlaid write (" + (policyCalls - base) + ")");
+    const b2 = policyCalls;
+    map.set("a", 3);                     // a write to the overlaid key MUST fire it
+    check(policyCalls - b2 >= 1,
+        () => "T5 crdt granularity: reconcile did not fire on the overlaid key's write");
+    check(v.isOverlaid("a"), () => "T5 crdt granularity: overlaid conflict was dropped");
+    v.dispose();
+}
+
 export function run() {
     coreFuzz();
     queryFuzz();
+    crdtFuzz();
+    crdtGranularity();
 }

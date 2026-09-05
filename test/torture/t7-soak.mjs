@@ -14,8 +14,9 @@
  * leaves tracker.size()===0 and the node census back at baseline (F-04 witnessed).
  */
 import { createLeakTracker } from "@zakkster/lite-leak";
-import { project, fromAccessors } from "../../Project.js";
-import { SEED, makePrng, frac, check, makeOracle, validate, graphSnapshot, graphDelta, metrics } from "./harness.mjs";
+import { signal } from "@zakkster/lite-signal";
+import { project, projectCRDT, fromAccessors } from "../../Project.js";
+import { SEED, makePrng, frac, check, makeOracle, validate, graphSnapshot, graphDelta, metrics, makeFakeClock, makeFakeMap } from "./harness.mjs";
 
 const CYCLES = 4096;
 const KEYS = ["a", "b", "c", "d"];
@@ -112,8 +113,85 @@ export async function run() {
     const psize = pruneTracker.size();
     check(psize === 0, () => "T7 prune: tracker retained " + psize + " after dispose");
 
+    // -- TTL sub-soak: 1000 ttl overlays hold at most ONE handle -----------
+    // Staggered deadlines exercise the re-arm path; the counting fake clock
+    // proves maxOutstanding() === 1 at every instant, and outstanding() returns
+    // to 0 after the drain fire and after dispose(). Own tracker + gc/settle pair.
+    const ttlTracker = createLeakTracker({ name: "lite-project-ttl" });
+    const clock = makeFakeClock();
+    const ttlBacking = new Map();
+    let tv = project(fromAccessors((k) => ttlBacking.get(k), (k, val) => ttlBacking.set(k, val)), clock);
+    for (let i = 0; i < 1000; i++) {
+        tv.set("t" + i, i, { ttl: 100 + i });
+        check(clock.maxOutstanding() === 1, () => "T7 ttl: >1 handle after set " + i);
+    }
+    check(clock.outstanding() === 1, () => "T7 ttl: expected one armed handle before firing");
+    clock.advance(100 + 1000);                       // past every deadline
+    check(tv.overlaidCount() === 0, () => "T7 ttl: overlays survived their deadlines");
+    check(tv.dirtyCount() === 0, () => "T7 ttl: dirtyCount not cleared by the fires");
+    check(clock.outstanding() === 0, () => "T7 ttl: a handle survived the drain fire");
+    check(clock.maxOutstanding() === 1, () => "T7 ttl: one-handle invariant broke during the soak");
+    tv.set("last", 1, { ttl: 5 });                   // arm one more; dispose must cancel it
+    check(clock.outstanding() === 1, () => "T7 ttl: re-arm after full drain failed");
+    tv.dispose();
+    check(clock.outstanding() === 0, () => "T7 ttl: dispose did not cancel the pending handle");
+    ttlTracker.track(tv, t7Cleanup, "ttl");
+    tv = null;
+
+    globalThis.gc(); await settle(50);
+    globalThis.gc(); await settle(50);
+    const tsize = ttlTracker.size();
+    const taudit = ttlTracker.audit();
+    check(tsize === 0, () => "T7 ttl: tracker retained " + tsize + " after dispose");
+    check(taudit.length === 0, () => "T7 ttl: audit findings " + taudit.length);
+
     // conservation: everything disposed, node census back at baseline.
     const dAfter = graphDelta(base);
     check(dAfter.nodes === 0, () => "T7 conservation: node census off baseline by " + dAfter.nodes);
     void cleanupCount;
+
+    // -- projectCRDT build/dispose sub-soak ---------------------------------
+    // The reconcile effect + per-overlaid-key tracked reads are the nodes under
+    // test: a disposed handle must leave the census flat at cycle scale (t6's
+    // Proof 6 is a warm-pass gate, not a per-call build/dispose witness). ONE
+    // fake LWW-Map source is reused across every cycle; its lazily-created
+    // per-key cells are NOT under test, so the census baseline is taken AFTER a
+    // one-cycle warm-up that materialises them. Own tracker + gc/settle pair.
+    // NUMBER tag, module cleanup -- neither closes over the handle.
+    const crdtTracker = createLeakTracker({ name: "lite-project-crdt" });
+    const fake = makeFakeMap({ signal });
+    const CKEYS = ["cx", "cy", "cz"];
+
+    // warm-up: build one handle to materialise the fake's persistent cells.
+    let wv = projectCRDT(fake);
+    wv.set(CKEYS[0], -1); fake.set(CKEYS[0], -1);   // echo -> reconcile drops the draft
+    wv.set(CKEYS[1], -2);
+    wv.set(CKEYS[2], -3);
+    wv.commit();
+    wv.dispose();
+    wv = null;
+
+    const cbase = graphSnapshot();
+    for (let c = 0; c < CYCLES; c++) {
+        const val = c + 1;                          // strictly monotone -> the echo always fires
+        let cv = projectCRDT(fake);
+        cv.set(CKEYS[0], val); fake.set(CKEYS[0], val);   // echo -> reconcile fires and drops it
+        cv.set(CKEYS[1], val + 1);                  // staged
+        cv.set(CKEYS[2], val + 2);                  // staged
+        cv.commit();                                // promote the remaining drafts
+        // tag is a NUMBER, cleanup is a module fn -- neither closes over `cv`.
+        crdtTracker.track(cv, t7Cleanup, c);
+        cv.dispose();
+        cv = null;
+    }
+
+    globalThis.gc(); await settle(50);
+    globalThis.gc(); await settle(50);
+
+    const csize = crdtTracker.size();
+    const caudit = crdtTracker.audit();
+    check(csize === 0, () => "T7 crdt: tracker retained " + csize + " handles after " + CYCLES + " dispose cycles");
+    check(caudit.length === 0, () => "T7 crdt: audit findings " + caudit.length);
+    const cDelta = graphDelta(cbase);
+    check(cDelta.nodes === 0, () => "T7 crdt: node census off baseline by " + cDelta.nodes);
 }

@@ -24,16 +24,38 @@ Peer dependency: @zakkster/lite-signal ^1.5.0 (uses createRoot). ESM only. MIT.
 ## Entry points
 
 - createProjector(reg) -> { project, keyedStore }   // bind to any lite-signal registry
-- project(source) -> Projection                       // default registry
+- project(source, opts?) -> Projection                // default registry. [1.3] opts =
+                                                      // {now?, setTimer?, clearTimer?} injectable
+                                                      // clock for overlay TTL (all-or-none; mixed = TypeError)
 - keyedStore(initial?) -> { get, set, has, keys }     // minimal built-in source
 - VERSION -> string                                   // shipped package version, synced to package.json
 
 ## Projection handle
 
-get(key) | set(key,value) | clear(key) | commit(key?) [one key or all] | revert() |
+get(key) | set(key,value,opts?) | clear(key) | commit(key?) [one key or all] | revert() |
 dirtyCount() [TRACKED reactive] | isDirty() [TRACKED reactive] |
 isOverlaid(key) | overlaidCount() | peek(key) [untracked effective read] |
 forEachOverlay(fn) | reconcileAll(policy?) | dispose() [recycle all owned nodes] |
+commitWhere(pred) [1.3] | clearWhere(pred) [1.3]
+  [predicate-scoped partial ops. pred(key, stagedValue) -- the forEachOverlay callback
+  order, NOT ReconcilePolicy's. Visit slots in insertion order, ONE reactive propagation
+  each. commitWhere writes source.set(key,value) + clears each matching overlay; clearWhere
+  drops matching overlays with ZERO source writes. A throwing pred is non-atomic on the core
+  handle: already-committed keys stay committed, dirtyCount()===overlaidCount(). projectQuery
+  OVERRIDES commitWhere to keep the single-write law (one setQueryData for the matching fields,
+  then clear them per-key; non-matching drafts survive -- it does NOT reuse commit()'s revert()).] |
+set(key,value,{ttl}) [1.3]
+  [overlay TTL: schedules an auto-REVERT at now()+ttl (a finite number > 0, source untouched --
+  "the optimistic edit expired, fall back to authoritative"). ONE re-armed platform timer per
+  projection; each slot stores its own deadline; O(slots) cold scan on arm/fire (no side Map,
+  no per-set alloc on the warm path). Bad ttl (0/-1/NaN/Infinity/"5"/null) throws BEFORE staging.
+  Re-set WITH ttl re-arms (earlier deadline re-arms eagerly, later one fires spuriously + re-arms);
+  re-set WITHOUT ttl cancels the expiry (each set fully specifies its overlay's lifetime). EVERY
+  transition to un-overlaid (clear/commit(key)/commit()/revert/reconcileAll drop/commitWhere/
+  clearWhere/the fire) cancels that key's expiry; dispose() cancels the pending handle. F-03:
+  confirmOnEcho is reference-equality (Object.is) -- an object draft cannot echo-confirm across
+  references; the fix is a caller-supplied structural policy (reconcileAll/forEachPatch skip
+  accept one), NO deep-equal helper ships (fail-open trap), and the TTL is the shipped self-heal.] |
 forEachPatch(fn, skip?) [1.2] | toPatch(skip?) -> [{key,from,to}] [1.2]
   [patch emission: iterate exactly the overlaid keys as fn(key, from, to) -- from =
   UNTRACKED current source value, to = staged overlay. Read-only + untracked: safe
@@ -66,10 +88,10 @@ prune() -> number [1.1] [release slots that are BOTH un-overlaid AND unobserved;
 
 ## Library adapters
 
-- projectStore(store)            // lite-store proxy. Per-key granular drafts;
+- projectStore(store, opts?)     // [1.3] opts forwards the injectable clock. lite-store proxy. Per-key granular drafts;
                                  // commit() writes through store[key]=v.
                                  // Top-level keys; pass a nested proxy to go deeper.
-- projectRoom(room, {policy?})   // lite-room room.storage (LWW-Map).
+- projectRoom(room, {policy?})   // [1.3] opts also carry the clock keys (now/setTimer/clearTimer). lite-room room.storage (LWW-Map).
                                  // Presentation-only optimistic drafts: set = local
                                  // draft (not synced), commit() = room.storage.set
                                  // (writes + syncs), auto-reconcile drops confirmed
@@ -95,6 +117,31 @@ prune() -> number [1.1] [release slots that are BOTH un-overlaid AND unobserved;
                                  // retargeting the prototype, inherited props on prev are
                                  // not absorbed, and symbol-keyed drafts survive commit.
                                  // A custom merge owns all three concerns itself.
+- projectCRDT(map, opts?)        // [1.4] lite-crdt LWW-Map (doc.map(name)). FINE-GRAINED
+                                 // per-key drafts (unlike projectRoom's coarse storage):
+                                 // overlaying/committing one cell never re-runs a consumer
+                                 // of another. opts = {policy?, transact?, + clock keys}.
+                                 // set(key,v) stages a draft (CRDT untouched); commit(key?)
+                                 // promotes via map.set (one op per key / N frames; pass
+                                 // opts.transact = doc.transact to coalesce a burst into ONE
+                                 // ops frame + one change -- wraps commit AND commitWhere).
+                                 // auto-reconcile drops confirmed drafts on an overlaid key's
+                                 // authoritative change (local echo or remote applyOp);
+                                 // conflicts AND concurrent authoritative deletes (read as
+                                 // undefined) stay masked. map consumed structurally
+                                 // (get/set); no hard lite-crdt dep; never touches the doc or
+                                 // map.store. dispose() stops the reconcile effect.
+                                 // HAZARD (recorded): lite-crdt's get returns a deep READ-ONLY
+                                 // WRAPPER for object values -> Object.is confirmOnEcho can
+                                 // NEVER auto-confirm an object draft (use {ttl} or a
+                                 // structural policy; never mutate the authoritative wrapper).
+                                 // HAZARD: lite-crdt STRING-COERCES keys, so drafts on 5 and
+                                 // "5" are two projection slots committing into ONE cell (last
+                                 // write wins); dirtyCount() never reveals it -- stage under one
+                                 // key type. A "__proto__" map key throws CRDTError on commit
+                                 // (fail closed: the draft stays staged). Dispose the projection
+                                 // BEFORE the doc (a commit after doc.dispose() writes nothing
+                                 // yet still clears the drafts -- the dead-source hazard).
 
 ## Zero-GC
 
@@ -108,4 +155,6 @@ a Map entry, and two pooled nodes. Warm the keys you churn.
   consumer that first reads the key; without detachment they would be adopted by
   that consumer and cascade-disposed on its next re-run. createRoot detaches them.
 - A projection only refines what the source exposes: over lite-room's coarse
-  storage it is coarse (any storage change re-evaluates every projected key).
+  storage it is coarse (any storage change re-evaluates every projected key). Over
+  a lite-crdt LWW-Map (projectCRDT) it is FINE-GRAINED -- per-key reactive get(key)
+  -- so committing one cell never re-runs a consumer of another. [1.4]

@@ -7,13 +7,20 @@
  *      toggles with one effect subscribed to dirtyCount(), the pool's
  *      poolGrowths AND totalAllocations deltas are both exactly 0.
  */
-import { project, keyedStore } from "../../Project.js";
-import { effect } from "@zakkster/lite-signal";
-import { check, runOpsGate, runAllocsGate, graphSnapshot, graphDelta, metrics, recordGc } from "./harness.mjs";
+import { project, projectCRDT, keyedStore } from "../../Project.js";
+import { effect, signal } from "@zakkster/lite-signal";
+import { check, runOpsGate, runAllocsGate, graphSnapshot, graphDelta, metrics, recordGc, makeFakeMap } from "./harness.mjs";
 
 const N = 256;
 const MASK = N - 1;               // power-of-2 keyset, bitmask index
 const HOT = 200000;
+
+// Proof 5 fixtures, hoisted so the measured body allocates nothing itself: a
+// no-op injected clock (never fires; the overlays are cleared/committed each
+// iteration), one ttl opts bag, and two match-all predicates.
+const NOOP_CLOCK = { now: () => 0, setTimer: () => 1, clearTimer: () => {} };
+const TTL_OPTS = { ttl: 1000 };
+const PRED_ALL = () => true;
 
 export function run() {
     // Pre-touch a bounded key set so every slot (overlay signal + projected
@@ -99,6 +106,48 @@ export function run() {
             " settled=" + patchAllocs.result.settled + " bytesPerCall=" + patchAllocs.bytesPerCall +
             " " + JSON.stringify(patchAllocs.report.violations));
     void acc;
+
+    // -- Proof 5: warm ttl re-set + commitWhere + clearWhere retain 0 B/call.
+    // Its OWN handle under the injected NO-OP clock (T8: the Proof 1-4 view is
+    // bound to the default clock and still holds 32 overlays from Proof 4). The
+    // clock never fires, so each iteration fully specifies + drops its overlay:
+    // set(k, i, {ttl}) arms, then commitWhere/clearWhere drops it (cancelling the
+    // expiry). check() ONLY -- it must NOT overwrite metrics.allocBytesPerOp /
+    // metrics.allocRetainedBytesPerCall (those carry the triangle numbers the
+    // GATE line + CHANGELOG quote).
+    const v5 = project(src, NOOP_CLOCK);
+    for (let i = 0; i < N; i++) v5.get(keys[i]);          // warm every slot
+    const ttlAllocs = runAllocsGate((i) => {
+        const k = keys[i & MASK];
+        v5.set(k, i, TTL_OPTS);
+        if (i & 1) v5.commitWhere(PRED_ALL); else v5.clearWhere(PRED_ALL);
+    }, { iterations: 20000, batches: 8 });
+    check(ttlAllocs.ok,
+        () => "T6 Proof 5 (ttl re-set + where-ops) failed the zero-retention gate: verdict=" +
+            ttlAllocs.report.verdict + " settled=" + ttlAllocs.result.settled +
+            " bytesPerCall=" + ttlAllocs.bytesPerCall + " " + JSON.stringify(ttlAllocs.report.violations));
+    v5.dispose();
+
+    // -- Proof 6: projectCRDT warm echo-drop reconcile pass. Each iteration stages
+    // a scalar draft then writes the authoritative echo, so the reconcile effect's
+    // steady-state body (dirtyCount + forEachOverlay + reconcileAll drop) fires and
+    // drops -- and retains 0 B/call. check() ONLY: it must NOT overwrite
+    // metrics.allocBytesPerOp / metrics.allocRetainedBytesPerCall (those carry the
+    // triangle numbers the GATE line + CHANGELOG quote).
+    const cmap = makeFakeMap({ signal });
+    for (let i = 0; i < N; i++) cmap.set(keys[i], i);
+    const cv = projectCRDT(cmap);
+    for (let i = 0; i < N; i++) cv.get(keys[i]);          // warm every slot
+    const echoAllocs = runAllocsGate((i) => {
+        const k = keys[i & MASK];
+        cv.set(k, i);                                     // stage (effect fires; conflict, kept)
+        cmap.set(k, i);                                   // authoritative echo (effect fires; drops)
+    }, { iterations: 20000, batches: 8 });
+    check(echoAllocs.ok,
+        () => "T6 projectCRDT warm echo-drop reconcile pass failed the zero-retention gate: verdict=" +
+            echoAllocs.report.verdict + " settled=" + echoAllocs.result.settled +
+            " bytesPerCall=" + echoAllocs.bytesPerCall + " " + JSON.stringify(echoAllocs.report.violations));
+    cv.dispose();
 
     v.dispose();
 }

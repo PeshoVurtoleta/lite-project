@@ -3,6 +3,150 @@
 All notable changes to `@zakkster/lite-project` are documented here. The format
 follows Keep a Changelog; this project adheres to semantic versioning.
 
+## [1.4.0] - 2026-09-05
+
+### Added
+
+- **`projectCRDT(map, opts?)`** -- a draft-overlay adapter for a
+  `@zakkster/lite-crdt` LWW-Map (`doc.map(name)`). Unlike `projectRoom` (which
+  wraps lite-room's **coarse** storage -- one `entries` signal, any change re-runs
+  every projected key), an LWW-Map has **fine-grained** reactive `get(key)`, so
+  `projectCRDT` is truly granular: overlaying or committing one cell never re-runs
+  a consumer of another. `set(key, value)` stages a local draft (the CRDT is
+  untouched); `commit(key?)` promotes drafts via `map.set` (one op per committed
+  key -- LWW ops are commutative + idempotent, so N frames are semantically one);
+  an auto-reconcile drops drafts the authoritative cell catches up to (a local
+  echo or a remote `applyOp`) while leaving conflicts -- and a concurrent
+  authoritative **delete** (reads as `undefined`) -- masked. The reconcile trigger
+  is ONE effect that reads `dirtyCount()` (tracked -- re-derives the dependency set
+  on every overlay-set transition) plus `map.get(k)` for each currently-overlaid
+  key, then calls `reconcileAll(policy)`; it re-runs only on overlay-set
+  transitions and on authoritative changes to overlaid keys. The map is consumed
+  **structurally** (any `{ get, set }` with a fine-grained reactive `get`), so
+  there is no hard dependency on lite-crdt, and the adapter never touches the doc,
+  `map.store`, or the coarse reads (`keys`/`values`/`entries`/`size`).
+- **`opts.transact`** -- an optional hook (e.g. `doc.transact`) that wraps both
+  `commit` and `commitWhere` so an N-key burst coalesces into ONE ops frame + one
+  change (measured: staging 3 keys emits 0 ops; committing emits 3 ops / 3 frames
+  with no `transact`, 3 ops / **1** frame under `transact`). The branch is resolved
+  once at construction; a supplied-but-non-function `transact` throws before any
+  node is created. `LWWMapLike`, `ProjectCRDTOptions`, and the `projectCRDT`
+  declaration added to `Project.d.ts`; `decisions/0003-project-crdt.md` records the
+  design.
+
+### Notes (recorded contracts, not bugs)
+
+- **Read-only object wrapper.** lite-crdt's `get(key)` returns a deep **read-only
+  wrapper** for object/array values (a different reference than the one passed to
+  `set`, WeakMap-cached and stable across reads). So `confirmOnEcho` (`Object.is`)
+  can **never** auto-confirm an object-valued draft over `projectCRDT`, even on a
+  genuine local echo -- use a `{ ttl }` draft (the shipped self-heal) or a
+  caller-supplied **structural** policy (whose reads pass through the wrapper
+  transparently). A policy must never attempt to mutate the authoritative value it
+  is handed for an object -- it is that read-only wrapper and lite-crdt throws
+  `readonly`. Scalars confirm normally.
+- **String-coercion key aliasing.** lite-crdt coerces every map key to a string,
+  but projection slots are keyed by `PropertyKey`. Drafts on `5` and `"5"` are TWO
+  projection slots that commit into ONE CRDT cell (last write wins), and
+  `dirtyCount()` never reveals the collision -- stage under one key type. A
+  `"__proto__"` map key is not usable in lite-crdt (`map.set` throws
+  `CRDTError("misconfigured")`); the adapter does not wrap that policy -- a commit
+  of a `"__proto__"` draft propagates the CRDT's own error with the draft still
+  staged and `dirtyCount()` consistent (fail closed).
+- **Dispose order.** `doc.dispose()` makes subsequent mutations silent no-ops, so a
+  commit **after** the doc is disposed writes nothing yet still clears the drafts
+  (an inherited dead-source data-loss class). Dispose the projection **before** the
+  doc.
+
+### Tests
+
+- `test/crdt_test.mjs` (19 tests, real `@zakkster/lite-crdt` on the default
+  registry): op-counter (stage/commit/transact frames), the wrapper pin (object
+  draft after a genuine echo stays overlaid; a structural policy drops it), TTL
+  heal over `projectCRDT`, numeric/symbol key-alias pins, `"__proto__"` commit
+  fail-closed, granularity (a consumer of `get("b")` runs once across 10 commits to
+  `"a"`; the reconcile effect does not fire on non-overlaid-key writes), missing-key
+  draft (`from === undefined`; a remote `applyOp` re-runs the projected read),
+  authoritative-delete conflict, dispose ordering, and the post-`doc.dispose()`
+  commit hazard.
+- Torture: `makeFakeMap` (a registry-parametric structural fake LWW-Map) drives new
+  `T4` (echo/conflict/late-overlay per key), `T5` (`projectCRDT` fuzz oracle + the
+  granularity law), `T6` (a warm echo-drop reconcile pass -- retains 0 B/call),
+  and `T9` controls `(j)` (a coarse-read effect fails the granularity law) and
+  `(k)` (a peek-only stale-deps effect misses a late-overlay echo). GATE unchanged:
+  `leak=size 0/0 findings=0 warnings=0 | gc major=0 minor=0 maxMs=0.00 | retained=0.00 B/op growths=0`.
+
+## [1.3.0] - 2026-09-05
+
+### Added
+
+- **Overlay TTL -- `set(key, value, { ttl })`.** Stage an overlay that
+  auto-**reverts** at `now() + ttl` (a finite number > 0, in the clock's units):
+  the draft is dropped and the source is **never** touched -- "the optimistic edit
+  expired; fall back to authoritative". One re-armed platform timer per projection
+  (each slot stores its own deadline; arm/fire do an `O(slots)` cold scan -- no
+  side `Map`, no per-`set` allocation on the warm path). A bad `ttl`
+  (`0`, `-1`, `NaN`, `Infinity`, `"5"`, `null`, ...) throws **before** staging. A
+  re-set **with** `ttl` re-arms (an earlier deadline re-arms eagerly; a later one
+  lets the armed timer fire spuriously and re-arm); a re-set **without** `ttl`
+  cancels the pending expiry -- each `set` fully specifies its overlay's lifetime.
+  Every transition to un-overlaid (`clear`, `commit(key)`, `commit()`, `revert`,
+  a `reconcileAll` drop, `commitWhere`, `clearWhere`, and the fire itself) cancels
+  that key's expiry, and `dispose()` cancels any pending handle.
+- **Injectable clock -- `project(source, { now, setTimer, clearTimer })`.**
+  All-or-none: supply all three (each a function) or none. A **mixed** clock is a
+  `TypeError` (it would compute deadlines on one timeline and arm on another --
+  fail closed). Defaults wrap `performance.now` / `setTimeout` / `clearTimeout`.
+  Forwarded by `projectStore(store, opts?)`, `projectRoom(room, opts?)`, and
+  `projectQuery(qc, key, opts?)` (the flat bag; `project` reads only the clock
+  keys). `SetOptions`, `ProjectionClock`, and `ProjectOptions` added to
+  `Project.d.ts`.
+- **`Projection.commitWhere(pred)` / `Projection.clearWhere(pred)`** -- predicate-
+  scoped partial save / discard. `pred(key, stagedValue)` (the `forEachOverlay`
+  callback order, not `ReconcilePolicy`'s), visited in slots order, one reactive
+  propagation each. `commitWhere` writes and clears only the matching overlays;
+  `clearWhere` drops them with **zero** source writes. A throwing `pred` is
+  non-atomic on the core handle (already-committed keys stay committed and
+  `dirtyCount() === overlaidCount()`). `projectQuery` **overrides** `commitWhere`
+  to keep the single-write law: one `setQueryData(key, prev => merge(prev,
+  overlays))` for the matching fields, then the committed fields are cleared
+  per-key -- the non-matching drafts survive (it does **not** reuse the `commit()`
+  override's `revert()`, which would drop them too).
+
+  **F-03 recorded.** `confirmOnEcho` is reference-equality (`Object.is`), so an
+  object-valued draft can never echo-confirm against a structurally-equal source
+  value of a different reference. The fix is a **caller-supplied** structural
+  policy (`reconcileAll(policy)` and the `forEachPatch` skip param accept one);
+  this library ships **no** deep-equal helper (a naive structural equal is a
+  fail-open trap). The TTL is the shipped safety net: a stuck object draft
+  self-heals on its deadline. Recorded in `decisions/0002-overlay-ttl.md`
+  (dev-only; not shipped).
+
+### Verified
+
+- 30 new `test/ttl_test.mjs` cases (fire at / not-before the deadline, byte-
+  identical source after a fire, re-arm + one-handle, plain re-set cancels,
+  `null` / `{}` / `{policy}` bags behave as plain `set` and still cancel,
+  cancellation at every ABSENT-transition site, the F-03 self-heal, the ttl +
+  mixed-clock + non-object-`project`-opts `TypeError`s, `commitWhere` /
+  `clearWhere` exact match + one
+  propagation + throwing-pred consistency, a set-with-ttl honoured inside a fire
+  subscriber, post-dispose inertness, and the four adapters incl. the
+  `projectQuery` single-write `commitWhere`); **114 tests total**, `node --test`.
+- Torture green (default seed):
+  `leak=size 0/0 findings=0 warnings=0 | gc major=0 minor=0 maxMs=0.00 |
+  alloc=n/a retained=0.00 B/op growths=0` (the binding channels are `major=0`,
+  `retained=0.00`, `growths=0`; the `alloc=` per-op bracket prints as-is, `n/a`
+  when the profiler's heap window was inconclusive). T4 gains the TTL door
+  (deterministic fake clock: expire / not-before / re-arm / cancel + the F-03
+  object heal). T6 gains Proof 5 -- warm ttl re-set + `commitWhere` + `clearWhere`
+  under an injected no-op clock retain `0 B/call` at `maxBytesPerCall 0` (the warm
+  no-ttl triangle passes the P0 gates unchanged). T7 gains a 1000-TTL sub-soak:
+  `maxOutstanding() === 1` at every instant, `0` after the drain fire and after
+  `dispose()`, tracker back to `size()===0`. T9 gains controls (h) a default-clock
+  projection tripping the deterministic expiry assertion, and (i) a leaky per-key
+  timer tripping the one-handle bound.
+
 ## [1.2.0] - 2026-09-05
 
 ### Added

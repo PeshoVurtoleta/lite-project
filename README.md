@@ -93,16 +93,18 @@ In steady state the projection allocates nothing: toggling an overlay on a key y
 
 Bind the primitives to a lite-signal registry. Pass the default namespace for normal use, or a `createRegistry({...})` result for an isolated graph (tests, the zero-GC gate). The package also exports `project` and `keyedStore` pre-bound to the default registry for the common case.
 
-### `project(source) -> Projection`
+### `project(source, opts?) -> Projection`
 
-`source` is any object with a reactive `get(key)` and a `set(key, value)`. Returns a handle:
+`source` is any object with a reactive `get(key)` and a `set(key, value)`. `opts` is an optional injectable clock for overlay TTL -- `{ now, setTimer, clearTimer }`, all-or-none (a mixed clock is a `TypeError`); it defaults to `performance.now` / `setTimeout` / `clearTimeout`. Returns a handle:
 
 | method | description |
 | --- | --- |
 | `get(key)` | reactive: overlay value if staged, else the source value |
-| `set(key, value)` | stage an **ephemeral** overlay (source untouched) |
+| `set(key, value, opts?)` | stage an **ephemeral** overlay (source untouched); pass `{ ttl }` to auto-revert it <sub>1.3</sub> |
 | `clear(key)` | drop one key's overlay (revert that key) |
 | `commit(key?)` | write one key's overlay (or, with no arg, all) into the source, then clear |
+| `commitWhere(pred)` | write + clear only the overlays where `pred(key, value)` is true <sub>1.3</sub> |
+| `clearWhere(pred)` | drop only the overlays where `pred(key, value)` is true (source untouched) <sub>1.3</sub> |
 | `revert()` | drop all overlays |
 | `dirtyCount()` | **tracked / reactive**: count of staged overlays — wire a Save badge to it |
 | `isDirty()` | **tracked / reactive**: `dirtyCount() > 0` |
@@ -177,6 +179,27 @@ Projects a single query entry's data **object**, exposing its **fields** as the 
 
 The default merge copies **own enumerable** properties, symbols included, and defines them rather than assigning them. That matters for three field names you would otherwise lose silently: a field literally called `__proto__` lands as a real own key (assignment would retarget the prototype and drop it), inherited properties on `prev` are not absorbed into the record, and a symbol-keyed draft survives the commit instead of evaporating while `dirtyCount()` reports it saved. A custom `merge` is on its own for all three.
 
+### `projectCRDT(map, { policy, transact })` -- fine-grained drafts over [lite-crdt](https://www.npmjs.com/package/@zakkster/lite-crdt) <sub>1.4</sub>
+
+```js
+import { projectCRDT } from "@zakkster/lite-project";
+
+const doc = createCRDTDoc({ replicaId });
+const map = doc.map("profile");                       // a lite-crdt LWW-Map
+const draft = projectCRDT(map, { transact: doc.transact });
+
+draft.set("name", "Ada");          // optimistic edit, the CRDT is untouched
+draft.set("city", "London");
+draft.commit();                    // both cells promoted in ONE ops frame (transact)
+```
+
+Where `projectRoom` wraps lite-room's **coarse** storage (a single `entries` signal -- any change re-evaluates every projected key), a lite-crdt LWW-Map exposes a **fine-grained** reactive `get(key)`, so `projectCRDT` is truly granular: overlaying or committing one cell never re-runs a consumer of another. `set(key, value)` stages a local draft (no op emitted); `commit(key?)` promotes drafts through `map.set` -- one op per committed key (LWW ops are commutative and idempotent, so N frames are semantically one). Pass `transact` (e.g. `doc.transact`) to coalesce a burst into a single ops frame; it wraps both `commit` and `commitWhere`. An auto-reconcile drops a draft the authoritative cell catches up to (a local echo or a remote `applyOp`) while leaving **conflicts** -- and a concurrent authoritative **delete**, which reads as `undefined` -- masked. The map is consumed structurally (any `{ get, set }` whose `get` is fine-grained reactive), so there is no hard dependency on lite-crdt, and the projection never touches the doc or `map.store`. `dispose()` stops the reconcile effect.
+
+Two hazards are recorded contracts, not bugs:
+
+- **Read-only object wrapper.** lite-crdt's `get(key)` returns a deep **read-only wrapper** for object/array values (a different reference than the one you passed to `set`). So `confirmOnEcho` (`Object.is`) can never auto-confirm an **object-valued** draft, even on a genuine local echo -- the wrapper breaks reference equality. Use a `{ ttl }` draft (the shipped self-heal) or a caller-supplied **structural** policy, whose reads pass through the wrapper transparently; never mutate the authoritative value a policy is handed (it is read-only and lite-crdt throws). Scalars confirm normally.
+- **String-coercion key aliasing.** lite-crdt coerces every map key to a string. Drafts on `5` and `"5"` are two projection slots that commit into one cell (last write wins), and `dirtyCount()` never reveals the collision -- stage under one key type. A `"__proto__"` map key throws `CRDTError` on commit (fail closed: the draft stays staged). And because `doc.dispose()` makes writes silent no-ops, a commit **after** the doc is disposed writes nothing yet still clears the drafts -- dispose the projection before the doc.
+
 ## Patch emission <sub>1.2</sub>
 
 The overlay bag already knows every staged draft's `to`; `forEachPatch` adds the source's `from` so a draft can cross the wire without re-walking the view.
@@ -200,6 +223,37 @@ const patch = draft.toPatch();   // [{ key: "name", from: undefined, to: "Ada" }
 An overlaid key is emitted whether or not `Object.is(from, to)`: the visit set stays equal to `dirtyCount()` and `commit()`'s write set, so a patch consumer (an LWW-Map op, a CRDT bump, an HTTP PATCH field) is never silently dropped. To suppress unchanged drafts, pass the same predicate shape reconcile uses -> `draft.forEachPatch(fn, confirmOnEcho)`. A throwing `source.get` propagates on the offending key with the overlay bag intact; callers needing atomicity use `toPatch()` (a partial array never escapes). The patch and `commit()` are two views of one delta: applying `toPatch()` to a copy of the source yields the same state `commit()` would write.
 
 Present on the `projectStore` / `projectRoom` / `projectQuery` handles too (for `projectQuery`, `from` is the cached record's field value).
+
+## Overlay TTL + partial commit <sub>1.3</sub>
+
+A pending overlay that never gets its ack has no way back. `set(key, value, { ttl })` gives it one: the overlay auto-**reverts** at `now() + ttl` (a finite number > 0), dropping the draft while the source stays untouched -- "the optimistic edit expired; fall back to authoritative".
+
+```js
+const draft = project(source);
+
+draft.set("status", "saving", { ttl: 5000 });   // reverts in 5s unless the ack clears it first
+// ... the server confirms -> draft.clear("status") (or reconcile) cancels the expiry
+```
+
+One re-armed timer runs per projection (each key stores its own deadline; arm and fire do an `O(slots)` cold scan, so the warm `set` path allocates nothing). A bad `ttl` throws **before** staging. A re-set **with** `ttl` re-arms; a re-set **without** `ttl` cancels the pending expiry -- each `set` fully specifies its overlay's lifetime. Every transition to un-overlaid (`clear`, `commit`, `revert`, a reconcile drop, `commitWhere` / `clearWhere`, and the fire itself) cancels that key's expiry, and `dispose()` cancels any pending handle.
+
+For a **deterministic** TTL (tests, an animation clock, a server tick) pass an injectable clock -- all-or-none, or a mixed clock is a `TypeError`:
+
+```js
+let t = 0;
+const clock = { now: () => t, setTimer: (fn, ms) => schedule(fn, t + ms), clearTimer: cancel };
+const draft = project(source, clock);            // forwarded by projectStore/projectRoom/projectQuery too
+```
+
+`commitWhere(pred)` and `clearWhere(pred)` are predicate-scoped partial saves: `pred(key, stagedValue)` (the `forEachOverlay` callback order) selects which overlays to act on, in one reactive propagation. `commitWhere` writes and clears only the matches; `clearWhere` discards them with zero source writes. A throwing `pred` is non-atomic on the core handle -- already-committed keys stay committed and `dirtyCount() === overlaidCount()`. On `projectQuery`, `commitWhere` is still a **single** `setQueryData` write for the matching fields, and the non-matching drafts survive.
+
+```js
+draft.set("name", "Ada");
+draft.set("email", "ada@x.dev");
+draft.commitWhere((key) => key !== "email");     // save name, keep email staged
+```
+
+**F-03.** `confirmOnEcho` is reference-equality (`Object.is`), so an object-valued draft can never echo-confirm against a structurally-equal source value of a different reference. The fix is a **caller-supplied** structural policy -- `reconcileAll(policy)` and the `forEachPatch` skip param both accept one; this library ships **no** deep-equal helper (a naive structural equal is a fail-open trap). The TTL is the shipped safety net: a stuck object draft self-heals on its deadline.
 
 ## Conventions
 

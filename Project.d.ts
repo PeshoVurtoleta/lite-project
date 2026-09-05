@@ -1,4 +1,4 @@
-// Type declarations for @zakkster/lite-project v1.2.0
+// Type declarations for @zakkster/lite-project v1.4.0
 // Zero-GC projections for @zakkster/lite-signal.
 // (c) 2026 Zahary Shinikchiev <shinikchiev@yahoo.com> -- MIT
 
@@ -26,6 +26,30 @@ export type ReconcilePolicy<K extends PropertyKey = PropertyKey, V = unknown> =
     (authoritative: V, overlayValue: V, key: K) => boolean;
 
 /**
+ * Options for a single {@link Projection.set}. `ttl` (a finite number > 0, in the
+ * clock's units) auto-REVERTS the staged overlay at `now() + ttl` -- the source is
+ * never touched. A bad `ttl` throws before staging; a re-set without `ttl` cancels
+ * a prior expiry (each set fully specifies its overlay's lifetime).
+ */
+export interface SetOptions {
+    ttl?: number;
+}
+
+/**
+ * An injectable clock for overlay TTL. `now()` returns a monotonic number,
+ * `setTimer(fn, ms)` schedules `fn` after `ms` and returns a handle, and
+ * `clearTimer(handle)` cancels it. All-or-none: supply all three or none.
+ */
+export interface ProjectionClock {
+    now(): number;
+    setTimer(fn: () => void, ms: number): unknown;
+    clearTimer(handle: unknown): void;
+}
+
+/** Options for {@link project} / {@link Projector.project}: an optional injectable clock. */
+export interface ProjectOptions extends Partial<ProjectionClock> {}
+
+/**
  * One staged draft as a patch entry: the current source value (`from`) and the
  * staged overlay value (`to`) for `key`. The materialized shape returned by
  * {@link Projection.toPatch}.
@@ -44,8 +68,12 @@ export interface Patch<K extends PropertyKey = PropertyKey, V = unknown> {
 export interface Projection<K extends PropertyKey = PropertyKey, V = unknown> {
     /** Reactive: the overlay value if one is staged for `key`, else the source value. */
     get(key: K): V;
-    /** Stage an EPHEMERAL overlay for `key`. The source is NOT mutated. */
-    set(key: K, value: V): void;
+    /**
+     * Stage an EPHEMERAL overlay for `key`. The source is NOT mutated. Pass
+     * `{ ttl }` to auto-revert the overlay at `now() + ttl`; a re-set without
+     * `ttl` cancels a pending expiry.
+     */
+    set(key: K, value: V, opts?: SetOptions): void;
     /** Drop one key's overlay (revert that key to the source). */
     clear(key: K): void;
     /** Untracked diagnostic: is `key` currently overlaid? */
@@ -92,6 +120,18 @@ export interface Projection<K extends PropertyKey = PropertyKey, V = unknown> {
     reconcileAll(policy?: ReconcilePolicy<K, V>): void;
     /** Write staged overlays into the source, then clear them. With `key`, commits just that key. */
     commit(key?: K): void;
+    /**
+     * Predicate-scoped partial commit: write and clear only the overlaid keys for
+     * which `pred(key, stagedValue)` returns true (the {@link Projection.forEachOverlay}
+     * callback order), in one propagation. A throwing `pred` propagates with the
+     * already-committed keys committed and `dirtyCount() === overlaidCount()`.
+     */
+    commitWhere(pred: (key: K, value: V) => boolean): void;
+    /**
+     * Predicate-scoped partial discard: drop only the overlaid keys for which
+     * `pred(key, stagedValue)` returns true. The source is never touched.
+     */
+    clearWhere(pred: (key: K, value: V) => boolean): void;
     /** Drop all overlays. */
     revert(): void;
     /**
@@ -160,6 +200,7 @@ export interface ProjectorRegistry {
 export interface Projector {
     project<K extends PropertyKey = PropertyKey, V = unknown>(
         source: ProjectionSource<K, V>,
+        opts?: ProjectOptions,
     ): Projection<K, V>;
     keyedStore<K extends PropertyKey = PropertyKey, V = unknown>(
         initial?: Record<PropertyKey, V>,
@@ -172,6 +213,7 @@ export function createProjector(reg: ProjectorRegistry): Projector;
 /** Project a keyed source (default registry). */
 export function project<K extends PropertyKey = PropertyKey, V = unknown>(
     source: ProjectionSource<K, V>,
+    opts?: ProjectOptions,
 ): Projection<K, V>;
 
 /** Minimal built-in keyed reactive source (default registry). */
@@ -219,6 +261,7 @@ export function makeReconciler<K extends PropertyKey = PropertyKey, V = unknown>
  */
 export function projectStore<V = unknown>(
     store: Record<PropertyKey, V>,
+    opts?: ProjectOptions,
 ): Projection<PropertyKey, V>;
 
 /** The subset of a @zakkster/lite-room handle that {@link projectRoom} consumes. */
@@ -231,8 +274,8 @@ export interface RoomLike {
     };
 }
 
-/** Options for {@link projectRoom}. */
-export interface ProjectRoomOptions {
+/** Options for {@link projectRoom}. Extends the injectable clock for overlay TTL. */
+export interface ProjectRoomOptions extends Partial<ProjectionClock> {
     /** Reconciliation policy; defaults to {@link confirmOnEcho}. */
     policy?: ReconcilePolicy<string, unknown>;
 }
@@ -257,8 +300,9 @@ export interface QueryClientLike {
     setQueryData(key: unknown, valueOrUpdater: unknown | ((prev: unknown) => unknown)): unknown;
 }
 
-/** Options for {@link projectQuery}. */
-export interface ProjectQueryOptions<V extends object = Record<PropertyKey, unknown>> {
+/** Options for {@link projectQuery}. Extends the injectable clock for overlay TTL. */
+export interface ProjectQueryOptions<V extends object = Record<PropertyKey, unknown>>
+    extends Partial<ProjectionClock> {
     /**
      * The query's reactive data accessor (e.g. `query.data`). When supplied,
      * projected reads track the cache and auto-reconcile is armed. Omit to degrade
@@ -287,3 +331,53 @@ export function projectQuery<V extends object = Record<PropertyKey, unknown>>(
     key: unknown,
     opts?: ProjectQueryOptions<V>,
 ): Projection<keyof V, unknown>;
+
+/**
+ * The subset of a @zakkster/lite-crdt LWW-Map (`doc.map(name)`) that
+ * {@link projectCRDT} consumes. `get(key)` must be a FINE-GRAINED reactive read
+ * (re-runs only when that key's cell changes); `set(key, value)` emits a CRDT op.
+ * Keys are string-coerced by lite-crdt.
+ */
+export interface LWWMapLike {
+    /** Fine-grained reactive read: tracks the cell backing `key`. */
+    get(key: string): unknown;
+    /** Write the cell for `key` (emits a CRDT op). */
+    set(key: string, value: unknown): void;
+    /** Optional authoritative delete (emits a tombstone op). */
+    delete?(key: string): void;
+}
+
+/** Options for {@link projectCRDT}. Extends the injectable clock for overlay TTL. */
+export interface ProjectCRDTOptions extends Partial<ProjectionClock> {
+    /** Reconciliation policy for auto-reconcile; defaults to {@link confirmOnEcho}. */
+    policy?: ReconcilePolicy<string, unknown>;
+    /**
+     * Optional transact hook (e.g. `doc.transact`) that wraps `commit` and
+     * `commitWhere` so an N-key burst coalesces into ONE ops frame + one change.
+     * A supplied-but-non-function value throws before any node is created.
+     */
+    transact?: <T>(fn: () => T) => T;
+}
+
+/**
+ * Project a @zakkster/lite-crdt LWW-Map (`doc.map(name)`) as a per-key DRAFT
+ * overlay. Inherits the map's fine-grained granularity, so overlaying or
+ * committing one cell never re-runs a consumer of another. `set` stages a local
+ * draft, `commit(key?)` promotes drafts via `map.set` (one op per key; pass
+ * `opts.transact` to coalesce a burst into one frame), and an auto-reconcile drops
+ * drafts the authoritative cell catches up to while leaving conflicts (and
+ * concurrent authoritative deletes) masked.
+ *
+ * TWO recorded hazards: (1) lite-crdt's `get` returns a deep READ-ONLY WRAPPER for
+ * object values, so `confirmOnEcho` (Object.is) never auto-confirms an object
+ * draft -- use a `{ ttl }` draft or a structural policy, and never mutate the
+ * authoritative value a policy is handed. (2) Keys are string-coerced, so drafts
+ * on `5` and `"5"` are two slots committing into one cell (last write wins).
+ * Consumed structurally (no hard dependency on lite-crdt) and never touches the
+ * doc or `map.store`. Dispose the projection BEFORE the doc. The returned handle's
+ * `dispose()` also stops the reconcile effect.
+ */
+export function projectCRDT(
+    map: LWWMapLike,
+    opts?: ProjectCRDTOptions,
+): Projection<string, unknown>;

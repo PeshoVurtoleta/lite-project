@@ -4,9 +4,9 @@
  * fail is decoration. Each control reuses the SAME RULES / runOpsGate / validate /
  * oracle as the gate it proves, so a control can never drift from its gate.
  */
-import { createRegistry, CapacityError, effect } from "@zakkster/lite-signal";
+import { createRegistry, CapacityError, effect, signal } from "@zakkster/lite-signal";
 import { project, createProjector, fromAccessors, keyedStore } from "../../Project.js";
-import { die, check, runOpsGate, runAllocsGate, makeOracle, validate, graphSnapshot } from "./harness.mjs";
+import { die, check, runOpsGate, runAllocsGate, makeOracle, validate, graphSnapshot, makeFakeClock, makeFakeMap } from "./harness.mjs";
 
 /**
  * Run `fn` expecting it to reach die() (which calls process.exit after writing to
@@ -131,5 +131,89 @@ export function run() {
         if (gg.ok) die("T9 (g): a per-visit-allocating forEachPatch emitter passed the zero-retention gate (bytesPerCall=" + gg.bytesPerCall + ")");
         sink.length = 0;
         v.dispose();
+    }
+
+    // (h) the T4 deterministic TTL expiry assertion, re-run against a DEFAULT
+    // (real) clock, must trip: with no injected advance nothing has fired, so the
+    // overlay is still staged and the "expired" assertion fails. Proves the
+    // injected clock has teeth. Dispose after, so no real setTimeout handle lives.
+    {
+        const src = keyedStore({ k: 0 });
+        const v = project(src);                     // default real clock -- cannot advance
+        v.set("k", 5, { ttl: 1 });
+        expectDie(
+            () => check(!v.isOverlaid("k"), () => "ttl overlay did not expire"),
+            "T9 (h)");
+        v.dispose();                                // cancel the real handle
+    }
+
+    // (i) a per-key-timer variant (a clock whose clearTimer is a no-op, so every
+    // re-arm LEAKS a handle) driven through the same makeFakeClock counters must
+    // trip the same maxOutstanding() <= 1 bound the T7 gate asserts. Decreasing
+    // deadlines force a re-arm on every set.
+    {
+        const base = makeFakeClock();
+        const leakyClock = { now: base.now, setTimer: base.setTimer, clearTimer: () => {} };
+        const src = keyedStore({});
+        const v = project(src, leakyClock);
+        for (let i = 0; i < 5; i++) v.set("k" + i, i, { ttl: 100 - i * 10 });
+        expectDie(
+            () => check(base.maxOutstanding() <= 1, () => "outstanding handles exceeded 1"),
+            "T9 (i)");
+        v.dispose();
+    }
+
+    // (j) a COARSE-read reconcile effect (reads every cell in the map instead of
+    // only the overlaid keys) must FAIL the granularity run-count law the fine
+    // projectCRDT effect satisfies: an authoritative write to a NON-overlaid key
+    // fires the coarse pass, so the policy counter moves where the gate demands 0.
+    // Same makeFakeMap / policy-counter shape as t5's crdtGranularity gate.
+    {
+        const map = makeFakeMap({ signal });
+        const allKeys = ["a"];
+        for (let i = 0; i < 10; i++) { const n = "n" + i; map.set(n, 0); allKeys.push(n); }
+        map.set("a", 0);
+        let policyCalls = 0;
+        const policy = (auth, ov) => { policyCalls++; return Object.is(auth, ov); };
+        const source = { get: (k) => map.get(k), set: (k, val) => map.set(k, val) };
+        const v = project(source);
+        // The BROKEN effect: reads EVERY cell (whole-map coarse), not only overlays.
+        const stop = effect(() => {
+            v.dirtyCount();
+            for (const k of allKeys) map.get(k);        // COARSE: tracks every cell
+            v.reconcileAll(policy);
+        });
+        v.set("a", 9); map.set("a", 7);                 // a overlaid, conflict kept
+        const base = policyCalls;
+        for (let i = 0; i < 10; i++) map.set("n" + i, i + 1);   // NON-overlaid writes
+        expectDie(
+            () => check(policyCalls - base === 0,
+                () => "reconcile fired on non-overlaid writes (" + (policyCalls - base) + ")"),
+            "T9 (j)");
+        stop(); v.dispose();
+    }
+
+    // (k) a PEEK-ONLY stale-deps effect (drops the view.dirtyCount() tracked read)
+    // must MISS a late-overlay echo: a key overlaid AFTER the effect's last run has
+    // its source cell untracked, so the echo never fires the reconcile and the
+    // draft sticks -- isOverlaid stays true where the fine effect drops it.
+    {
+        const map = makeFakeMap({ signal });
+        map.set("k", 0);
+        const source = { get: (kk) => map.get(kk), set: (kk, vv) => map.set(kk, vv) };
+        const v = project(source);
+        const _trackSrc = (kk) => { map.get(kk); };
+        const stop = effect(() => {
+            // NO view.dirtyCount() -- the stale-deps trap. At first run nothing is
+            // overlaid, so forEachOverlay tracks no cell and the effect never re-runs.
+            v.forEachOverlay(_trackSrc);
+            v.reconcileAll();
+        });
+        v.set("k", 5);                                   // overlaid AFTER the last (empty) run
+        map.set("k", 5);                                 // echo -- a correct effect drops it
+        expectDie(
+            () => check(!v.isOverlaid("k"), () => "late-overlay echo was not dropped"),
+            "T9 (k)");
+        stop(); v.dispose();
     }
 }
